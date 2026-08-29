@@ -118,11 +118,19 @@ def run_interactive(
                         console.warning(
                             f"Saved model was {loaded.summary.model}; continuing with {config.model}."
                         )
+                    if agent.plan_snapshot()["active"]:
+                        console.plan(agent.plan_snapshot(), title="Restored plan")
                 except RivetError as exc:
                     console.error(str(exc))
                 continue
             if command == "/status":
                 console.status(agent.status())
+                continue
+            if command == "/plan":
+                if argument:
+                    console.warning("/plan does not accept an argument.")
+                else:
+                    console.plan(agent.plan_snapshot())
                 continue
             if command == "/diff":
                 try:

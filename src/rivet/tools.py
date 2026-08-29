@@ -6,7 +6,8 @@ from typing import Any, Callable
 
 from .config import Config
 from .errors import RivetError, ToolError
-from .types import JsonObject
+from .plan import PlanState
+from .types import EventHandler, JsonObject
 from .workspace import Workspace
 
 
@@ -33,12 +34,21 @@ class ToolSpec:
 
 
 class ToolRegistry:
-    def __init__(self, config: Config, approver: Approver | None = None) -> None:
+    def __init__(
+        self,
+        config: Config,
+        approver: Approver | None = None,
+        *,
+        plan: PlanState | None = None,
+        event_handler: EventHandler | None = None,
+    ) -> None:
         self.config = config
         self.workspace = Workspace(
             config.workspace, max_output_chars=config.max_tool_output_chars
         )
         self.approver = approver
+        self.plan = plan if plan is not None else PlanState()
+        self.events = event_handler or (lambda _event, _data: None)
         self._tools = {tool.name: tool for tool in self._build_tools()}
 
     @property
@@ -132,6 +142,7 @@ class ToolRegistry:
         expected = schema.get("type")
         type_matches = {
             "object": isinstance(value, dict),
+            "array": isinstance(value, list),
             "string": isinstance(value, str),
             "integer": isinstance(value, int) and not isinstance(value, bool),
             "boolean": isinstance(value, bool),
@@ -145,15 +156,33 @@ class ToolRegistry:
             required = schema.get("required", [])
             for name in required:
                 if name not in value:
-                    return f"missing required argument: {name}", name
+                    child = f"{field}.{name}" if field else name
+                    return f"missing required argument: {child}", child
             if schema.get("additionalProperties") is False:
                 extras = sorted(set(value) - set(properties))
                 if extras:
-                    return f"unexpected argument: {extras[0]}", extras[0]
+                    child = f"{field}.{extras[0]}" if field else extras[0]
+                    return f"unexpected argument: {child}", child
             for name, item in value.items():
                 item_schema = properties.get(name)
                 if isinstance(item_schema, dict):
-                    error = cls._validate_value(item_schema, item, name)
+                    child = f"{field}.{name}" if field else name
+                    error = cls._validate_value(item_schema, item, child)
+                    if error is not None:
+                        return error
+
+        if expected == "array" and isinstance(value, list):
+            minimum = schema.get("minItems")
+            maximum = schema.get("maxItems")
+            if isinstance(minimum, int) and len(value) < minimum:
+                return f"{field} must contain at least {minimum} item(s)", field
+            if isinstance(maximum, int) and len(value) > maximum:
+                return f"{field} must contain at most {maximum} item(s)", field
+            item_schema = schema.get("items")
+            if isinstance(item_schema, dict):
+                for index, item in enumerate(value):
+                    item_field = f"{field}[{index}]" if field else f"[{index}]"
+                    error = cls._validate_value(item_schema, item, item_field)
                     if error is not None:
                         return error
 
@@ -181,6 +210,50 @@ class ToolRegistry:
     def _build_tools(self) -> tuple[ToolSpec, ...]:
         object_schema = {"type": "object", "additionalProperties": False}
         return (
+            ToolSpec(
+                "update_plan",
+                "Create or update a concise progress plan for a multi-stage task. "
+                "Keep at most one step in progress, update it after meaningful progress, "
+                "and make every step completed or blocked before the final answer.",
+                {
+                    **object_schema,
+                    "properties": {
+                        "explanation": {
+                            "type": "string",
+                            "maxLength": 1000,
+                            "description": "Short reason for creating or revising the plan",
+                        },
+                        "steps": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 20,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "step": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 240,
+                                    },
+                                    "status": {
+                                        "type": "string",
+                                        "enum": [
+                                            "pending",
+                                            "in_progress",
+                                            "completed",
+                                            "blocked",
+                                        ],
+                                    },
+                                },
+                                "required": ["step", "status"],
+                            },
+                        },
+                    },
+                    "required": ["steps"],
+                },
+                self._update_plan,
+            ),
             ToolSpec(
                 "list_files",
                 "List workspace files and directories recursively. Hidden build/cache directories are skipped.",
@@ -302,3 +375,11 @@ class ToolRegistry:
                 mutating=True,
             ),
         )
+
+    def _update_plan(
+        self, steps: list[JsonObject], explanation: str = ""
+    ) -> JsonObject:
+        result = self.plan.update(steps, explanation)
+        if result["changed"]:
+            self.events("plan_updated", result)
+        return result

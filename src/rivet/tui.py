@@ -38,6 +38,7 @@ class Console:
     CYAN = "\x1b[36m"
 
     TOOL_LABELS = {
+        "update_plan": "Plan",
         "list_files": "List",
         "read_file": "Read",
         "search_text": "Search",
@@ -57,6 +58,9 @@ class Console:
         "failure": "×",
         "notice": "•",
         "pipe": "│",
+        "pending": "○",
+        "current": "●",
+        "blocked": "!",
     }
     ASCII_GLYPHS = {
         "top": "+-",
@@ -69,6 +73,9 @@ class Console:
         "failure": "x",
         "notice": "*",
         "pipe": "|",
+        "pending": "o",
+        "current": "*",
+        "blocked": "!",
     }
 
     def __init__(
@@ -165,6 +172,14 @@ class Console:
             print(f"  {prefix} {label}" + (f"  {detail}" if detail else ""), file=self.output)
         elif event == "tool_end":
             self._tool_result(data["name"], data["result"])
+        elif event == "plan_updated":
+            self.plan(data, title="Plan updated")
+        elif event == "plan_completion_required":
+            marker = self.style("!", self.YELLOW, self.BOLD)
+            print(
+                f"  {marker} Active plan still has unfinished steps",
+                file=self.output,
+            )
         elif event == "verification_required":
             files = ", ".join(data.get("files", [])) or "changed files"
             marker = self.style("!", self.YELLOW, self.BOLD)
@@ -225,6 +240,7 @@ class Console:
         rows = (
             ("/help", "show this help"),
             ("/status", "show conversation and verification state"),
+            ("/plan", "show the current task plan and progress"),
             ("/diff [path]", "show changes made in this conversation"),
             ("/sessions", "list recent saved conversations"),
             ("/resume [id]", "resume the latest or selected conversation"),
@@ -258,6 +274,39 @@ class Console:
         print(f"  verification {verification}", file=self.output)
         tracking = "complete" if status.get("workspace_tracking_complete", True) else "limited"
         print(f"  tracking    {tracking}", file=self.output)
+        plan = status.get("plan", {})
+        if isinstance(plan, dict) and plan.get("active"):
+            counts = plan.get("counts", {})
+            completed = counts.get("completed", 0) if isinstance(counts, dict) else 0
+            total = len(plan.get("steps", [])) if isinstance(plan.get("steps"), list) else 0
+            plan_status = "blocked" if plan.get("blocked") else f"{completed}/{total} completed"
+        else:
+            plan_status = "none"
+        print(f"  plan        {plan_status}", file=self.output)
+
+    def plan(self, plan: JsonObject, *, title: str = "Plan") -> None:
+        print(self.style(f"\n{title}", self.BOLD), file=self.output)
+        steps = plan.get("steps", [])
+        if not isinstance(steps, list) or not steps:
+            print("  no active plan", file=self.output)
+            return
+        explanation = str(plan.get("explanation") or "").strip()
+        if explanation:
+            print(self.style(f"  {explanation}", self.DIM), file=self.output)
+        for index, item in enumerate(steps, start=1):
+            if not isinstance(item, dict):
+                continue
+            status = str(item.get("status") or "pending")
+            text = str(item.get("step") or "")
+            if status == "completed":
+                marker = self.style(self.glyph("success"), self.GREEN, self.BOLD)
+            elif status == "in_progress":
+                marker = self.style(self.glyph("current"), self.CYAN, self.BOLD)
+            elif status == "blocked":
+                marker = self.style(self.glyph("blocked"), self.RED, self.BOLD)
+            else:
+                marker = self.style(self.glyph("pending"), self.DIM)
+            print(f"  {marker} {index}. {text}", file=self.output)
 
     def diff(self, result: JsonObject, path: str | None) -> None:
         print(self.style("\nDiff", self.BOLD), file=self.output)
@@ -339,6 +388,11 @@ class Console:
             return cls._truncate(str(arguments), 120)
         if name == "run_command":
             return cls._truncate(str(arguments.get("command") or ""), 120)
+        if name == "update_plan":
+            steps = arguments.get("steps", [])
+            count = len(steps) if isinstance(steps, list) else 0
+            explanation = cls._truncate(str(arguments.get("explanation") or ""), 80)
+            return f"{count} step(s)" + (f" | {explanation}" if explanation else "")
         if name == "search_text":
             query = cls._truncate(str(arguments.get("query") or ""), 70)
             path = str(arguments.get("path") or ".")
@@ -378,6 +432,10 @@ class Console:
             if result.get("tracking_complete") is False:
                 detail += " | tracking limited"
             return detail
+        if name == "update_plan":
+            steps = result.get("steps", [])
+            count = len(steps) if isinstance(steps, list) else 0
+            return f"{count} step(s)" + (" updated" if result.get("changed") else " unchanged")
         return str(result.get("path") or "done")
 
     def _text_block(self, speaker: str, text: str) -> None:

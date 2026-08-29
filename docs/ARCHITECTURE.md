@@ -10,12 +10,14 @@ framework and no server-hosted file or execution tool.
 repeated user turns
         |
       Agent -------- ContextManager ---- tool schemas ----> OpenAICompatibleClient
-        ^                  ^                                     |
-        |                  |                                     v
- SessionStore        tool result <---- ReAct loop <---- assistant text / tool_calls
-        ^
-        |
- versioned JSON
+        ^  ^               ^                                     |
+        |  |               |                                     v
+ PlanState |         tool result <---- ReAct loop <---- assistant text / tool_calls
+        ^  |
+        | SessionStore
+        |  ^
+        |  |
+        +- versioned JSON
                            ^                 |
                            |                 v
                      ToolRegistry ---- Workspace ---- local files and subprocesses
@@ -35,10 +37,11 @@ clearing conversation state and creating a fresh tool/diff boundary.
 | Requirement | Implementation |
 | --- | --- |
 | Conversation/session | `Agent` retains user turns, assistant messages, tool results, diff baseline, and execution evidence |
+| Task planning | `PlanState` validates explicit step status and exposes it through `update_plan`, `/plan`, and TUI events |
 | Session persistence | `SessionStore` atomically saves and validates versioned, workspace-scoped state |
 | Context bounding | `ContextManager` preserves the system prompt, first task, recent call-result units, and a deterministic checkpoint |
 | Terminal presentation | `Console` in `tui.py` renders compact semantic events with ANSI and plain-text modes |
-| Tool definitions | Seven JSON-schema function tools in `ToolRegistry` with local validation |
+| Tool definitions | Eight JSON-schema function tools in `ToolRegistry` with local validation |
 | Local execution | `Workspace` reads, searches, atomically edits, and runs bounded subprocesses |
 | Output parsing | `OpenAICompatibleClient` validates JSON replies or incrementally rebuilds SSE text and indexed tool-call deltas |
 | Completion evidence | `TaskState` records inspected/changed files and command outcomes; edits require a later successful check |
@@ -47,6 +50,7 @@ clearing conversation state and creating a fresh tool/diff boundary.
 
 ## Tools
 
+- `update_plan`: validated progress state for multi-stage work; not a workspace mutation.
 - `list_files`: bounded traversal with noisy cache/build directories omitted.
 - `read_file`: UTF-8 text with stable line numbers and binary rejection.
 - `search_text`: literal, glob-aware repository search.
@@ -60,6 +64,22 @@ clearing conversation state and creating a fresh tool/diff boundary.
 Tool schemas are sent to the model and enforced again by `ToolRegistry`. Required fields,
 unknown fields, scalar types, ranges, and string sizes are rejected before approval or local
 execution. Errors include a stable code, field name when relevant, and retryability hint.
+
+## Task planning
+
+`PlanState` is program-owned rather than inferred from assistant prose. For a multi-stage task,
+the model calls `update_plan` with concise steps whose status is `pending`, `in_progress`,
+`completed`, or `blocked`; local validation limits plan size, rejects duplicate steps, and
+allows at most one in-progress item. Repeating an unchanged plan produces an unchanged result,
+so loop detection still recognizes no progress. A final answer is rejected once when an active
+plan remains unfinished, then stopped explicitly if the model still fails to update it.
+
+Plan updates emit semantic TUI events and require no workspace approval because they do not
+change files. `/plan` renders the current state, `/status` shows its summary, and session files
+persist the validated plan alongside conversation and execution evidence. A cancelled or
+resumed task keeps unfinished progress; a new turn clears a terminal plan, while `/new` resets
+all planning state. A plan containing a genuinely blocked terminal step finishes with a blocked
+result instead of reporting success.
 
 ## Completion evidence
 
@@ -107,15 +127,15 @@ Launching `rivet` starts a persistent input loop. A later user
 request is appended to the same history after the preceding assistant final answer, so
 references such as "the function you just changed" have the required conversational context.
 Each user turn receives a fresh step budget and loop-protection counters, while successful
-tool evidence and the workspace diff remain session-wide. `/status`, `/diff`, `/sessions`,
+tool evidence and the workspace diff remain session-wide. `/plan`, `/status`, `/diff`, `/sessions`,
 `/resume`, `/new`, and `/exit` expose the essential session controls. `/resume` without an
 argument loads the most recently updated valid session; an ID from `/sessions` selects a
 specific one. `/new` resets the Agent and creates a new `ToolRegistry`, so conversation
 history and the in-memory diff baseline do not leak across conversations.
 
 `SessionStore` atomically updates one versioned JSON file after each completed turn under
-`.rivet/sessions`, which is ignored by Git. It persists provider messages, exact internal
-operation counters, command evidence, and the original file baselines needed by `/diff`.
+`.rivet/sessions`, which is ignored by Git. It persists provider messages, the current plan,
+exact internal operation counters, command evidence, and the original file baselines needed by `/diff`.
 The primary system prompt is reconstructed rather than saved because it contains the local
 workspace path; API credentials and endpoint configuration are never part of session state.
 A hash of the normalized workspace path prevents a session copied from another project from

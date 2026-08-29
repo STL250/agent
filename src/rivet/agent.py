@@ -9,6 +9,7 @@ from typing import Any
 from .config import Config
 from .context import ContextManager
 from .errors import SessionError
+from .plan import PlanState
 from .prompt import system_prompt
 from .tools import Approver, ToolRegistry
 from .types import EventHandler, JsonObject, Message, ModelClient, ModelReply, ToolCall
@@ -200,7 +201,13 @@ class Agent:
 
     def reset(self) -> None:
         """Start a new conversation and a new in-memory workspace diff baseline."""
-        self.tools = ToolRegistry(self.config, approver=self.approver)
+        self.plan = PlanState()
+        self.tools = ToolRegistry(
+            self.config,
+            approver=self.approver,
+            plan=self.plan,
+            event_handler=self.events,
+        )
         self.context: ContextManager | None = None
         self.state = TaskState()
         self.tasks: list[str] = []
@@ -219,8 +226,12 @@ class Agent:
             "turns": self.turns,
             "total_steps": self.total_steps,
             "messages": len(self.messages),
+            "plan": self.plan.snapshot(),
             **self.state.snapshot(),
         }
+
+    def plan_snapshot(self) -> JsonObject:
+        return self.plan.snapshot()
 
     def show_diff(self, path: str | None = None) -> JsonObject:
         return self.tools.workspace.show_diff(path)
@@ -233,6 +244,7 @@ class Agent:
             "turns": self.turns,
             "total_steps": self.total_steps,
             "conversation": self.context.export_conversation(),
+            "plan_state": self.plan.export_state(),
             "task_state": self.state.export_state(),
             "workspace_state": self.tools.workspace.export_diff_state(),
         }
@@ -263,8 +275,14 @@ class Agent:
             conversation,
             self.config.max_context_chars,
         )
+        restored_plan = PlanState.restore(payload.get("plan_state"))
         restored_state = TaskState.restore(payload.get("task_state"))
-        restored_tools = ToolRegistry(self.config, approver=self.approver)
+        restored_tools = ToolRegistry(
+            self.config,
+            approver=self.approver,
+            plan=restored_plan,
+            event_handler=self.events,
+        )
         try:
             drifted = restored_tools.workspace.restore_diff_state(
                 payload.get("workspace_state")
@@ -276,6 +294,7 @@ class Agent:
         restored_state.record_external_changes(drifted)
 
         self.tools = restored_tools
+        self.plan = restored_plan
         self.context = restored_context
         self.state = restored_state
         self.tasks = list(tasks)
@@ -293,10 +312,12 @@ class Agent:
                 0,
                 "empty_task",
                 self.messages,
-                self.state.snapshot(),
+                self._result_state(self.state),
             )
 
         normalized_task = task.strip()
+        if self.plan.terminal:
+            self.plan.clear()
         if self.context is None:
             self.context = ContextManager(
                 system_prompt(self.config.workspace),
@@ -319,6 +340,7 @@ class Agent:
         repeat_count = 0
         empty_replies = 0
         completion_reprompts = 0
+        plan_completion_reprompts = 0
 
         for step in range(1, self.config.max_steps + 1):
             compacted = context.compact()
@@ -420,11 +442,45 @@ class Agent:
                             step,
                             "repeated_tool_call",
                             tuple(context.messages),
-                            state.snapshot(),
+                            self._result_state(state),
                         )
                 continue
 
             if reply.content.strip():
+                if self.plan.active and not self.plan.terminal:
+                    plan_completion_reprompts += 1
+                    if plan_completion_reprompts >= 2:
+                        final = (
+                            "The model tried to finish while the active plan still had "
+                            "pending or in-progress steps."
+                        )
+                        self.events(
+                            "stopped",
+                            {"reason": "incomplete_plan", "turn": turn},
+                        )
+                        return self._finish(
+                            False,
+                            final,
+                            step,
+                            "incomplete_plan",
+                            tuple(context.messages),
+                            self._result_state(state),
+                        )
+                    self.events(
+                        "plan_completion_required",
+                        {"plan": self.plan.snapshot(), "step": step, "turn": turn},
+                    )
+                    context.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your active plan still has pending or in-progress steps. "
+                                "Continue the work, then call update_plan so every step is "
+                                "completed or genuinely blocked before the final answer."
+                            ),
+                        }
+                    )
+                    continue
                 if state.verification_required and not state.verification_passed:
                     completion_reprompts += 1
                     if completion_reprompts >= 2:
@@ -442,7 +498,7 @@ class Agent:
                             step,
                             "unverified_changes",
                             tuple(context.messages),
-                            state.snapshot(),
+                            self._result_state(state),
                         )
                     self.events(
                         "verification_required",
@@ -463,6 +519,16 @@ class Agent:
                         }
                     )
                     continue
+                if self.plan.blocked:
+                    self.events("stopped", {"reason": "blocked", "turn": turn})
+                    return self._finish(
+                        False,
+                        reply.content.strip(),
+                        step,
+                        "blocked",
+                        tuple(context.messages),
+                        self._result_state(state),
+                    )
                 self.events("completed", {"step": step, "turn": turn})
                 changed_this_turn = state.last_mutation_operation > turn_start_operation
                 verified_pending_change = (
@@ -481,7 +547,7 @@ class Agent:
                     step,
                     reason,
                     tuple(context.messages),
-                    state.snapshot(),
+                    self._result_state(state),
                 )
 
             empty_replies += 1
@@ -496,7 +562,7 @@ class Agent:
                     step,
                     "empty_model_response",
                     tuple(context.messages),
-                    state.snapshot(),
+                    self._result_state(state),
                 )
             context.append(
                 {
@@ -513,7 +579,7 @@ class Agent:
             self.config.max_steps,
             "max_steps",
             tuple(context.messages),
-            state.snapshot(),
+            self._result_state(state),
         )
 
     def _finish(
@@ -592,8 +658,11 @@ class Agent:
             step,
             "cancelled",
             tuple(context.messages),
-            state.snapshot(),
+            self._result_state(state),
         )
+
+    def _result_state(self, state: TaskState) -> JsonObject:
+        return {**state.snapshot(), "plan": self.plan.snapshot()}
 
     @staticmethod
     def _cancelled_tool_payload(name: str, *, skipped: bool = False) -> str:
