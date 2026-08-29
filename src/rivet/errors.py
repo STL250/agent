@@ -13,6 +13,10 @@ class ModelError(RivetError):
     """The model endpoint failed or returned an invalid response."""
 
 
+class SessionError(RivetError):
+    """A saved conversation could not be stored or restored safely."""
+
+
 class ToolError(RivetError):
     """A local tool could not complete its operation."""
 

@@ -48,35 +48,135 @@ class ToolRegistry:
     def execute(self, name: str, raw_arguments: str) -> str:
         tool = self._tools.get(name)
         if tool is None:
-            return self._json_error(f"unknown tool: {name}")
+            return self._json_error(f"unknown tool: {name}", code="UNKNOWN_TOOL")
         try:
             arguments = json.loads(raw_arguments or "{}")
         except json.JSONDecodeError as exc:
-            return self._json_error(f"arguments are not valid JSON: {exc.msg}")
+            return self._json_error(
+                f"arguments are not valid JSON: {exc.msg}", code="INVALID_ARGUMENT"
+            )
         if not isinstance(arguments, dict):
-            return self._json_error("tool arguments must be a JSON object")
+            return self._json_error(
+                "tool arguments must be a JSON object", code="INVALID_ARGUMENT"
+            )
+
+        validation_error = self._validate_value(tool.parameters, arguments)
+        if validation_error is not None:
+            message, field = validation_error
+            return self._json_error(
+                message, code="INVALID_ARGUMENT", field=field, retryable=True
+            )
 
         if tool.mutating:
             if self.config.approval_mode == "never":
-                return self._json_error("mutating tools are disabled by approval mode")
-            if self.config.approval_mode == "ask":
+                return self._json_error(
+                    "mutating tools are disabled by approval mode",
+                    code="APPROVAL_REQUIRED",
+                    retryable=False,
+                )
+            review_reason = None
+            if name == "run_command":
+                review_reason = self.workspace.command_review_reason(arguments["command"])
+            needs_approval = self.config.approval_mode == "ask" or (
+                self.config.approval_mode == "safe" and review_reason is not None
+            )
+            if needs_approval:
                 summary = json.dumps(arguments, ensure_ascii=False)[:500]
+                if review_reason:
+                    summary = f"[{review_reason}] {summary}"
                 if self.approver is None or not self.approver(name, summary):
-                    return self._json_error("operation was not approved by the user")
+                    return self._json_error(
+                        "operation was not approved by the user",
+                        code="APPROVAL_REQUIRED",
+                        retryable=True,
+                    )
 
         try:
             result = tool.handler(**arguments)
             return json.dumps({"ok": True, **result}, ensure_ascii=False)
         except TypeError as exc:
-            return self._json_error(f"invalid arguments: {exc}")
+            return self._json_error(
+                f"invalid arguments: {exc}", code="INVALID_ARGUMENT", retryable=True
+            )
         except (RivetError, OSError) as exc:
-            return self._json_error(str(exc))
+            return self._json_error(str(exc), code="TOOL_ERROR", retryable=True)
         except Exception as exc:  # defensive boundary: never crash the agent loop
-            return self._json_error(f"unexpected {type(exc).__name__}: {exc}")
+            return self._json_error(
+                f"unexpected {type(exc).__name__}: {exc}",
+                code="INTERNAL_ERROR",
+                retryable=False,
+            )
 
     @staticmethod
-    def _json_error(message: str) -> str:
-        return json.dumps({"ok": False, "error": message}, ensure_ascii=False)
+    def _json_error(
+        message: str,
+        *,
+        code: str = "TOOL_ERROR",
+        field: str | None = None,
+        retryable: bool = True,
+    ) -> str:
+        payload: JsonObject = {
+            "ok": False,
+            "error": message,
+            "code": code,
+            "retryable": retryable,
+        }
+        if field:
+            payload["field"] = field
+        return json.dumps(payload, ensure_ascii=False)
+
+    @classmethod
+    def _validate_value(
+        cls, schema: JsonObject, value: Any, field: str = ""
+    ) -> tuple[str, str | None] | None:
+        expected = schema.get("type")
+        type_matches = {
+            "object": isinstance(value, dict),
+            "string": isinstance(value, str),
+            "integer": isinstance(value, int) and not isinstance(value, bool),
+            "boolean": isinstance(value, bool),
+        }
+        if isinstance(expected, str) and not type_matches.get(expected, True):
+            label = field or "arguments"
+            return f"{label} must be of type {expected}", field or None
+
+        if expected == "object" and isinstance(value, dict):
+            properties = schema.get("properties", {})
+            required = schema.get("required", [])
+            for name in required:
+                if name not in value:
+                    return f"missing required argument: {name}", name
+            if schema.get("additionalProperties") is False:
+                extras = sorted(set(value) - set(properties))
+                if extras:
+                    return f"unexpected argument: {extras[0]}", extras[0]
+            for name, item in value.items():
+                item_schema = properties.get(name)
+                if isinstance(item_schema, dict):
+                    error = cls._validate_value(item_schema, item, name)
+                    if error is not None:
+                        return error
+
+        if expected == "string" and isinstance(value, str):
+            minimum = schema.get("minLength")
+            maximum = schema.get("maxLength")
+            if isinstance(minimum, int) and len(value) < minimum:
+                return f"{field} must contain at least {minimum} character(s)", field
+            if isinstance(maximum, int) and len(value) > maximum:
+                return f"{field} must not exceed {maximum} characters", field
+
+        if expected == "integer" and isinstance(value, int) and not isinstance(value, bool):
+            minimum = schema.get("minimum")
+            maximum = schema.get("maximum")
+            if isinstance(minimum, int) and value < minimum:
+                return f"{field} must be at least {minimum}", field
+            if isinstance(maximum, int) and value > maximum:
+                return f"{field} must be at most {maximum}", field
+
+        choices = schema.get("enum")
+        if isinstance(choices, list) and value not in choices:
+            return f"{field} must be one of: {', '.join(map(str, choices))}", field
+        return None
 
     def _build_tools(self) -> tuple[ToolSpec, ...]:
         object_schema = {"type": "object", "additionalProperties": False}
@@ -87,7 +187,12 @@ class ToolRegistry:
                 {
                     **object_schema,
                     "properties": {
-                        "path": {"type": "string", "description": "Workspace-relative directory"},
+                        "path": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 2000,
+                            "description": "Workspace-relative directory",
+                        },
                         "depth": {"type": "integer", "minimum": 0, "maximum": 8},
                         "max_entries": {"type": "integer", "minimum": 1, "maximum": 2000},
                     },
@@ -100,7 +205,7 @@ class ToolRegistry:
                 {
                     **object_schema,
                     "properties": {
-                        "path": {"type": "string"},
+                        "path": {"type": "string", "minLength": 1, "maxLength": 2000},
                         "start_line": {"type": "integer", "minimum": 1},
                         "end_line": {"type": "integer", "minimum": 1},
                     },
@@ -114,9 +219,14 @@ class ToolRegistry:
                 {
                     **object_schema,
                     "properties": {
-                        "query": {"type": "string"},
-                        "path": {"type": "string"},
-                        "file_glob": {"type": "string", "description": "For example *.py"},
+                        "query": {"type": "string", "minLength": 1, "maxLength": 10000},
+                        "path": {"type": "string", "minLength": 1, "maxLength": 2000},
+                        "file_glob": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 500,
+                            "description": "For example *.py",
+                        },
                         "max_results": {"type": "integer", "minimum": 1, "maximum": 1000},
                         "case_sensitive": {"type": "boolean"},
                     },
@@ -130,8 +240,8 @@ class ToolRegistry:
                 {
                     **object_schema,
                     "properties": {
-                        "path": {"type": "string"},
-                        "content": {"type": "string"},
+                        "path": {"type": "string", "minLength": 1, "maxLength": 2000},
+                        "content": {"type": "string", "maxLength": 2000000},
                     },
                     "required": ["path", "content"],
                 },
@@ -144,9 +254,9 @@ class ToolRegistry:
                 {
                     **object_schema,
                     "properties": {
-                        "path": {"type": "string"},
-                        "old": {"type": "string"},
-                        "new": {"type": "string"},
+                        "path": {"type": "string", "minLength": 1, "maxLength": 2000},
+                        "old": {"type": "string", "minLength": 1, "maxLength": 500000},
+                        "new": {"type": "string", "maxLength": 500000},
                         "count": {"type": "integer", "minimum": 1},
                     },
                     "required": ["path", "old", "new"],
@@ -155,18 +265,39 @@ class ToolRegistry:
                 mutating=True,
             ),
             ToolSpec(
-                "run_command",
-                "Run a shell command in the workspace. Output is captured, bounded, and returned with exit status.",
+                "show_diff",
+                "Show unified diffs for files changed by Rivet during the current task.",
                 {
                     **object_schema,
                     "properties": {
-                        "command": {"type": "string"},
+                        "path": {"type": "string", "minLength": 1, "maxLength": 2000},
+                        "context_lines": {"type": "integer", "minimum": 0, "maximum": 20},
+                    },
+                },
+                self.workspace.show_diff,
+            ),
+            ToolSpec(
+                "run_command",
+                "Run a shell command in the workspace. Output and exit status are bounded; "
+                "created, modified, and deleted workspace files are detected and reported.",
+                {
+                    **object_schema,
+                    "properties": {
+                        "command": {"type": "string", "minLength": 1, "maxLength": 10000},
                         "timeout": {"type": "integer", "minimum": 1, "maximum": 600},
+                        "purpose": {
+                            "type": "string",
+                            "enum": ["auto", "inspect", "verify"],
+                            "description": (
+                                "Use verify only when the command checks the latest changes; "
+                                "inspect commands never satisfy completion evidence."
+                            ),
+                        },
                     },
                     "required": ["command"],
                 },
-                lambda command, timeout=self.config.command_timeout: self.workspace.run_command(
-                    command, timeout
+                lambda command, timeout=self.config.command_timeout, purpose="auto": self.workspace.run_command(
+                    command, timeout, purpose
                 ),
                 mutating=True,
             ),

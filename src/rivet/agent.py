@@ -1,14 +1,174 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .config import Config
 from .context import ContextManager
+from .errors import SessionError
 from .prompt import system_prompt
 from .tools import Approver, ToolRegistry
-from .types import EventHandler, Message, ModelClient, ToolCall
+from .types import EventHandler, JsonObject, Message, ModelClient, ModelReply, ToolCall
+
+
+@dataclass
+class TaskState:
+    """Program-owned evidence collected throughout one user conversation."""
+
+    inspected_files: set[str] = field(default_factory=set)
+    changed_files: set[str] = field(default_factory=set)
+    commands: list[JsonObject] = field(default_factory=list)
+    operation_index: int = 0
+    last_mutation_operation: int = 0
+    last_successful_command_operation: int = 0
+    workspace_tracking_complete: bool = True
+
+    @classmethod
+    def restore(cls, payload: Any) -> "TaskState":
+        if not isinstance(payload, dict):
+            raise SessionError("saved task state must be an object")
+
+        def string_set(name: str) -> set[str]:
+            value = payload.get(name, [])
+            if (
+                not isinstance(value, list)
+                or len(value) > 10_000
+                or any(not isinstance(item, str) for item in value)
+            ):
+                raise SessionError(f"saved {name} must be a list of strings")
+            return set(value)
+
+        def counter(name: str) -> int:
+            value = payload.get(name, 0)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise SessionError(f"saved {name} must be a non-negative integer")
+            return value
+
+        commands = payload.get("commands", [])
+        if (
+            not isinstance(commands, list)
+            or len(commands) > 10_000
+            or any(not isinstance(command, dict) for command in commands)
+        ):
+            raise SessionError("saved commands must be a list of objects")
+        tracking = payload.get("workspace_tracking_complete", True)
+        if not isinstance(tracking, bool):
+            raise SessionError("saved workspace tracking flag must be boolean")
+
+        operation_index = counter("operation_index")
+        last_mutation = counter("last_mutation_operation")
+        last_successful = counter("last_successful_command_operation")
+        if last_mutation > operation_index or last_successful > operation_index:
+            raise SessionError("saved task operation indexes are inconsistent")
+        return cls(
+            inspected_files=string_set("inspected_files"),
+            changed_files=string_set("changed_files"),
+            commands=copy.deepcopy(commands),
+            operation_index=operation_index,
+            last_mutation_operation=last_mutation,
+            last_successful_command_operation=last_successful,
+            workspace_tracking_complete=tracking,
+        )
+
+    def record_tool_result(self, name: str, result: str) -> None:
+        self.operation_index += 1
+        try:
+            payload: Any = json.loads(result)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(payload, dict) or not payload.get("ok"):
+            return
+
+        path = payload.get("path")
+        if name == "read_file" and isinstance(path, str):
+            self.inspected_files.add(path)
+        elif name == "search_text":
+            for match in payload.get("matches", []):
+                match_path = match.get("path") if isinstance(match, dict) else None
+                if isinstance(match_path, str):
+                    self.inspected_files.add(match_path)
+        elif name in {"write_file", "replace_text"} and isinstance(path, str):
+            self.changed_files.add(path)
+            self.last_mutation_operation = self.operation_index
+        elif name == "run_command":
+            file_changes = payload.get("file_changes", [])
+            changed_by_command: list[JsonObject] = []
+            if isinstance(file_changes, list):
+                for change in file_changes:
+                    if not isinstance(change, dict):
+                        continue
+                    change_path = change.get("path")
+                    if isinstance(change_path, str):
+                        self.changed_files.add(change_path)
+                        changed_by_command.append(change)
+            if changed_by_command:
+                self.last_mutation_operation = self.operation_index
+            if payload.get("tracking_complete") is False:
+                self.workspace_tracking_complete = False
+            command_record: JsonObject = {
+                "command": str(payload.get("command") or ""),
+                "exit_code": payload.get("exit_code"),
+                "timed_out": bool(payload.get("timed_out")),
+                "cancelled": bool(payload.get("cancelled")),
+                "verification": bool(payload.get("verification")),
+                "purpose": str(payload.get("purpose") or "auto"),
+                "file_changes": changed_by_command,
+                "file_change_count": payload.get(
+                    "file_change_count", len(changed_by_command)
+                ),
+                "file_changes_truncated": bool(payload.get("file_changes_truncated")),
+                "tracking_complete": payload.get("tracking_complete") is not False,
+            }
+            self.commands.append(command_record)
+            if (
+                command_record["verification"]
+                and command_record["exit_code"] == 0
+                and not command_record["timed_out"]
+                and not command_record["cancelled"]
+            ):
+                self.last_successful_command_operation = self.operation_index
+
+    @property
+    def verification_required(self) -> bool:
+        return bool(self.changed_files)
+
+    @property
+    def verification_passed(self) -> bool:
+        return (
+            not self.verification_required
+            or self.last_successful_command_operation > self.last_mutation_operation
+        )
+
+    def snapshot(self) -> JsonObject:
+        return {
+            "inspected_files": sorted(self.inspected_files),
+            "changed_files": sorted(self.changed_files),
+            "commands": list(self.commands),
+            "verification_required": self.verification_required,
+            "verification_passed": self.verification_passed,
+            "workspace_tracking_complete": self.workspace_tracking_complete,
+        }
+
+    def export_state(self) -> JsonObject:
+        return {
+            "inspected_files": sorted(self.inspected_files),
+            "changed_files": sorted(self.changed_files),
+            "commands": copy.deepcopy(self.commands),
+            "operation_index": self.operation_index,
+            "last_mutation_operation": self.last_mutation_operation,
+            "last_successful_command_operation": self.last_successful_command_operation,
+            "workspace_tracking_complete": self.workspace_tracking_complete,
+        }
+
+    def record_external_changes(self, paths: list[str]) -> None:
+        if not paths:
+            return
+        self.operation_index += 1
+        self.last_mutation_operation = self.operation_index
+        self.changed_files.update(paths)
 
 
 @dataclass(frozen=True)
@@ -18,9 +178,12 @@ class AgentResult:
     steps: int
     reason: str
     messages: tuple[Message, ...]
+    state: JsonObject = field(default_factory=dict)
 
 
 class Agent:
+    """A stateful user conversation containing one or more programming turns."""
+
     def __init__(
         self,
         config: Config,
@@ -32,50 +195,174 @@ class Agent:
         self.config = config
         self.client = client
         self.events = event_handler or (lambda _event, _data: None)
-        self.tools = ToolRegistry(config, approver=approver)
+        self.approver = approver
+        self.reset()
+
+    def reset(self) -> None:
+        """Start a new conversation and a new in-memory workspace diff baseline."""
+        self.tools = ToolRegistry(self.config, approver=self.approver)
+        self.context: ContextManager | None = None
+        self.state = TaskState()
+        self.tasks: list[str] = []
+        self.turns = 0
+        self.total_steps = 0
+        self.last_result: AgentResult | None = None
+
+    @property
+    def messages(self) -> tuple[Message, ...]:
+        if self.context is None:
+            return ()
+        return tuple(self.context.messages)
+
+    def status(self) -> JsonObject:
+        return {
+            "turns": self.turns,
+            "total_steps": self.total_steps,
+            "messages": len(self.messages),
+            **self.state.snapshot(),
+        }
+
+    def show_diff(self, path: str | None = None) -> JsonObject:
+        return self.tools.workspace.show_diff(path)
+
+    def export_session_state(self) -> JsonObject:
+        if self.context is None or self.turns <= 0:
+            raise SessionError("there is no completed conversation to save")
+        return {
+            "tasks": list(self.tasks),
+            "turns": self.turns,
+            "total_steps": self.total_steps,
+            "conversation": self.context.export_conversation(),
+            "task_state": self.state.export_state(),
+            "workspace_state": self.tools.workspace.export_diff_state(),
+        }
+
+    def restore_session_state(self, payload: Any) -> list[str]:
+        """Replace this Agent's state with one validated saved conversation."""
+        if not isinstance(payload, dict):
+            raise SessionError("saved agent state must be an object")
+        tasks = payload.get("tasks")
+        if (
+            not isinstance(tasks, list)
+            or not tasks
+            or len(tasks) > 10_000
+            or any(not isinstance(task, str) or not task.strip() for task in tasks)
+        ):
+            raise SessionError("saved tasks must be a non-empty list of strings")
+
+        turns = self._saved_counter(payload, "turns")
+        total_steps = self._saved_counter(payload, "total_steps")
+        if turns != len(tasks):
+            raise SessionError("saved turn count does not match the task history")
+        conversation = payload.get("conversation")
+        if not isinstance(conversation, list):
+            raise SessionError("saved conversation must be a list")
+
+        restored_context = ContextManager.restore(
+            system_prompt(self.config.workspace),
+            conversation,
+            self.config.max_context_chars,
+        )
+        restored_state = TaskState.restore(payload.get("task_state"))
+        restored_tools = ToolRegistry(self.config, approver=self.approver)
+        try:
+            drifted = restored_tools.workspace.restore_diff_state(
+                payload.get("workspace_state")
+            )
+        except Exception as exc:
+            if isinstance(exc, SessionError):
+                raise
+            raise SessionError(f"saved workspace state is invalid: {exc}") from exc
+        restored_state.record_external_changes(drifted)
+
+        self.tools = restored_tools
+        self.context = restored_context
+        self.state = restored_state
+        self.tasks = list(tasks)
+        self.turns = turns
+        self.total_steps = total_steps
+        self.last_result = None
+        return drifted
 
     def run(self, task: str) -> AgentResult:
+        """Run one user turn while retaining earlier messages and workspace evidence."""
         if not task.strip():
-            return AgentResult(False, "Task is empty.", 0, "empty_task", ())
-        context = ContextManager(
-            system_prompt(self.config.workspace), task.strip(), self.config.max_context_chars
+            return AgentResult(
+                False,
+                "Task is empty.",
+                0,
+                "empty_task",
+                self.messages,
+                self.state.snapshot(),
+            )
+
+        normalized_task = task.strip()
+        if self.context is None:
+            self.context = ContextManager(
+                system_prompt(self.config.workspace),
+                normalized_task,
+                self.config.max_context_chars,
+            )
+        else:
+            self.context.append({"role": "user", "content": normalized_task})
+
+        self.tasks.append(normalized_task)
+        self.turns += 1
+        context = self.context
+        state = self.state
+        turn = self.turns
+        turn_start_operation = state.operation_index
+        verification_pending_at_start = (
+            state.verification_required and not state.verification_passed
         )
-        previous_signature: str | None = None
+        previous_observation: str | None = None
         repeat_count = 0
         empty_replies = 0
+        completion_reprompts = 0
 
         for step in range(1, self.config.max_steps + 1):
             compacted = context.compact()
             if compacted:
-                self.events("context_compacted", {"messages": len(context.messages)})
-            self.events("model_start", {"step": step})
-            reply = self.client.complete(context.messages, self.tools.schemas)
+                self.events(
+                    "context_compacted",
+                    {"messages": len(context.messages), "turn": turn},
+                )
+            self.events("model_start", {"step": step, "turn": turn})
+            try:
+                reply, streamed = self._complete_model(context.messages, step, turn)
+            except KeyboardInterrupt:
+                return self._cancelled_result(context, state, step, turn, "model request")
             assistant_message = self._assistant_message(reply.content, reply.tool_calls)
             context.append(assistant_message)
 
             if reply.content.strip():
-                self.events("assistant_text", {"text": reply.content})
+                self.events(
+                    "assistant_text",
+                    {
+                        "text": reply.content,
+                        "turn": turn,
+                        "has_tool_calls": bool(reply.tool_calls),
+                        "streamed": streamed,
+                    },
+                )
 
             if reply.tool_calls:
                 empty_replies = 0
-                for call in reply.tool_calls:
-                    signature = self._signature(call)
-                    if signature == previous_signature:
-                        repeat_count += 1
-                    else:
-                        previous_signature = signature
-                        repeat_count = 1
-                    if repeat_count >= 3:
-                        final = f"Stopped after the same tool call was requested three times: {call.name}."
-                        self.events("stopped", {"reason": "repeated_tool_call", "tool": call.name})
-                        return AgentResult(
-                            False, final, step, "repeated_tool_call", tuple(context.messages)
-                        )
+                for call_index, call in enumerate(reply.tool_calls):
                     self.events(
                         "tool_start",
-                        {"step": step, "name": call.name, "arguments": call.arguments},
+                        {
+                            "step": step,
+                            "turn": turn,
+                            "name": call.name,
+                            "arguments": call.arguments,
+                        },
                     )
-                    result = self.tools.execute(call.name, call.arguments)
+                    try:
+                        result = self.tools.execute(call.name, call.arguments)
+                    except KeyboardInterrupt:
+                        result = self._cancelled_tool_payload(call.name)
+                    state.record_tool_result(call.name, result)
                     context.append(
                         {
                             "role": "tool",
@@ -85,19 +372,132 @@ class Agent:
                         }
                     )
                     self.events(
-                        "tool_end", {"step": step, "name": call.name, "result": result}
+                        "tool_end",
+                        {
+                            "step": step,
+                            "turn": turn,
+                            "name": call.name,
+                            "result": result,
+                        },
                     )
+                    if self._tool_was_cancelled(result):
+                        for pending in reply.tool_calls[call_index + 1 :]:
+                            context.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": pending.id,
+                                    "name": pending.name,
+                                    "content": self._cancelled_tool_payload(
+                                        pending.name, skipped=True
+                                    ),
+                                }
+                            )
+                        return self._cancelled_result(
+                            context, state, step, turn, f"tool {call.name}"
+                        )
+                    observation = self._observation_signature(call, result)
+                    if observation == previous_observation:
+                        repeat_count += 1
+                    else:
+                        previous_observation = observation
+                        repeat_count = 1
+                    if repeat_count >= 3:
+                        final = (
+                            "Stopped after the same tool call produced the same result "
+                            f"three times: {call.name}."
+                        )
+                        self.events(
+                            "stopped",
+                            {
+                                "reason": "repeated_tool_call",
+                                "tool": call.name,
+                                "turn": turn,
+                            },
+                        )
+                        return self._finish(
+                            False,
+                            final,
+                            step,
+                            "repeated_tool_call",
+                            tuple(context.messages),
+                            state.snapshot(),
+                        )
                 continue
 
             if reply.content.strip():
-                self.events("completed", {"step": step})
-                return AgentResult(True, reply.content.strip(), step, "completed", tuple(context.messages))
+                if state.verification_required and not state.verification_passed:
+                    completion_reprompts += 1
+                    if completion_reprompts >= 2:
+                        final = (
+                            "Files were changed, but no successful verification command "
+                            "was run after the latest change."
+                        )
+                        self.events(
+                            "stopped",
+                            {"reason": "unverified_changes", "turn": turn},
+                        )
+                        return self._finish(
+                            False,
+                            final,
+                            step,
+                            "unverified_changes",
+                            tuple(context.messages),
+                            state.snapshot(),
+                        )
+                    self.events(
+                        "verification_required",
+                        {
+                            "files": sorted(state.changed_files),
+                            "step": step,
+                            "turn": turn,
+                        },
+                    )
+                    context.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "You changed files but have not run a successful verification "
+                                "command after the latest change. Inspect the diff, run the "
+                                "narrowest relevant check, and only then give a final answer."
+                            ),
+                        }
+                    )
+                    continue
+                self.events("completed", {"step": step, "turn": turn})
+                changed_this_turn = state.last_mutation_operation > turn_start_operation
+                verified_pending_change = (
+                    verification_pending_at_start
+                    and state.verification_passed
+                    and state.last_successful_command_operation > turn_start_operation
+                )
+                reason = (
+                    "completed_verified"
+                    if changed_this_turn or verified_pending_change
+                    else "completed"
+                )
+                return self._finish(
+                    True,
+                    reply.content.strip(),
+                    step,
+                    reason,
+                    tuple(context.messages),
+                    state.snapshot(),
+                )
 
             empty_replies += 1
             if empty_replies >= 2:
                 final = "Model returned two empty responses without tool calls."
-                self.events("stopped", {"reason": "empty_model_response"})
-                return AgentResult(False, final, step, "empty_model_response", tuple(context.messages))
+                self.events(
+                    "stopped", {"reason": "empty_model_response", "turn": turn}
+                )
+                return self._finish(
+                    False,
+                    final,
+                    step,
+                    "empty_model_response",
+                    tuple(context.messages),
+                    state.snapshot(),
+                )
             context.append(
                 {
                     "role": "user",
@@ -106,8 +506,123 @@ class Agent:
             )
 
         final = f"Stopped after reaching the {self.config.max_steps}-step limit."
-        self.events("stopped", {"reason": "max_steps"})
-        return AgentResult(False, final, self.config.max_steps, "max_steps", tuple(context.messages))
+        self.events("stopped", {"reason": "max_steps", "turn": turn})
+        return self._finish(
+            False,
+            final,
+            self.config.max_steps,
+            "max_steps",
+            tuple(context.messages),
+            state.snapshot(),
+        )
+
+    def _finish(
+        self,
+        success: bool,
+        final: str,
+        steps: int,
+        reason: str,
+        messages: tuple[Message, ...],
+        state: JsonObject,
+    ) -> AgentResult:
+        result = AgentResult(success, final, steps, reason, messages, state)
+        self.total_steps += steps
+        self.last_result = result
+        return result
+
+    def _complete_model(
+        self, messages: list[Message], step: int, turn: int
+    ) -> tuple[ModelReply, bool]:
+        stream = getattr(self.client, "complete_stream", None)
+        if not callable(stream):
+            return self.client.complete(messages, self.tools.schemas), False
+
+        stream_started = False
+
+        def on_text_delta(delta: str) -> None:
+            nonlocal stream_started
+            if not delta:
+                return
+            if not stream_started:
+                stream_started = True
+                self.events("assistant_stream_start", {"step": step, "turn": turn})
+            self.events(
+                "assistant_text_delta",
+                {"text": delta, "step": step, "turn": turn},
+            )
+
+        try:
+            reply = stream(messages, self.tools.schemas, on_text_delta)
+        except BaseException:
+            if stream_started:
+                self.events(
+                    "assistant_stream_end",
+                    {"step": step, "turn": turn, "cancelled": True},
+                )
+            raise
+        if stream_started:
+            self.events(
+                "assistant_stream_end",
+                {"step": step, "turn": turn, "cancelled": False},
+            )
+        return reply, stream_started
+
+    def _cancelled_result(
+        self,
+        context: ContextManager,
+        state: TaskState,
+        step: int,
+        turn: int,
+        phase: str,
+    ) -> AgentResult:
+        final = "Current operation cancelled. You can refine the request or continue."
+        context.append(
+            {
+                "role": "assistant",
+                "content": "[The previous operation was cancelled by the user.]",
+            }
+        )
+        self.events(
+            "cancelled",
+            {"phase": phase, "step": step, "turn": turn},
+        )
+        return self._finish(
+            False,
+            final,
+            step,
+            "cancelled",
+            tuple(context.messages),
+            state.snapshot(),
+        )
+
+    @staticmethod
+    def _cancelled_tool_payload(name: str, *, skipped: bool = False) -> str:
+        detail = "skipped after another tool was cancelled" if skipped else "cancelled by user"
+        return json.dumps(
+            {
+                "ok": False,
+                "cancelled": True,
+                "error": f"{name} {detail}",
+                "code": "CANCELLED",
+                "retryable": True,
+            },
+            ensure_ascii=False,
+        )
+
+    @staticmethod
+    def _tool_was_cancelled(result: str) -> bool:
+        try:
+            payload: Any = json.loads(result)
+        except json.JSONDecodeError:
+            return False
+        return isinstance(payload, dict) and payload.get("cancelled") is True
+
+    @staticmethod
+    def _saved_counter(payload: JsonObject, name: str) -> int:
+        value = payload.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise SessionError(f"saved {name} must be a non-negative integer")
+        return value
 
     @staticmethod
     def _signature(call: ToolCall) -> str:
@@ -117,6 +632,16 @@ class Agent:
         except json.JSONDecodeError:
             canonical = call.arguments.strip()
         return f"{call.name}:{canonical}"
+
+    @classmethod
+    def _observation_signature(cls, call: ToolCall, result: str) -> str:
+        try:
+            payload: Any = json.loads(result)
+            canonical_result = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        except json.JSONDecodeError:
+            canonical_result = result.strip()
+        material = f"{cls._signature(call)}:{canonical_result}".encode("utf-8")
+        return hashlib.sha256(material).hexdigest()
 
     @staticmethod
     def _assistant_message(content: str, calls: tuple[ToolCall, ...]) -> Message:

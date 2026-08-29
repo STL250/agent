@@ -7,6 +7,7 @@ from typing import Any, Callable, Protocol
 JsonObject = dict[str, Any]
 Message = dict[str, Any]
 EventHandler = Callable[[str, JsonObject], None]
+TextDeltaHandler = Callable[[str], None]
 
 
 @dataclass(frozen=True)

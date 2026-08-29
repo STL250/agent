@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import copy
 import json
 from typing import Any
 
+from .errors import SessionError
 from .types import Message
 
 
@@ -17,6 +19,35 @@ class ContextManager:
             {"role": "system", "content": system},
             {"role": "user", "content": task},
         ]
+
+    @classmethod
+    def restore(
+        cls, system: str, conversation: list[Message], max_chars: int
+    ) -> "ContextManager":
+        """Restore provider messages while replacing the machine-specific system prompt."""
+        if not conversation:
+            raise SessionError("saved conversation has no messages")
+        restored: list[Message] = []
+        for index, message in enumerate(conversation):
+            if not isinstance(message, dict):
+                raise SessionError(f"saved message {index + 1} is not an object")
+            role = message.get("role")
+            if role not in {"user", "assistant", "tool", "system"}:
+                raise SessionError(f"saved message {index + 1} has an invalid role")
+            if role == "system" and message.get("name") != cls.SUMMARY_NAME:
+                raise SessionError("saved conversation contains an untrusted system message")
+            restored.append(copy.deepcopy(message))
+        if restored[0].get("role") != "user":
+            raise SessionError("saved conversation must begin with a user message")
+
+        instance = cls.__new__(cls)
+        instance.max_chars = max_chars
+        instance.messages = [{"role": "system", "content": system}, *restored]
+        return instance
+
+    def export_conversation(self) -> list[Message]:
+        """Exclude the system prompt because it contains the local workspace path."""
+        return copy.deepcopy(self.messages[1:])
 
     def append(self, message: Message) -> None:
         self.messages.append(message)

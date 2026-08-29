@@ -1,52 +1,23 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Callable
 
 from . import __version__
 from .agent import Agent, AgentResult
 from .client import OpenAICompatibleClient
 from .config import Config
 from .errors import RivetError
-
-
-class Console:
-    def event(self, event: str, data: dict[str, Any]) -> None:
-        if event == "model_start":
-            print(f"\n[step {data['step']}] thinking...")
-        elif event == "context_compacted":
-            print(f"[context] compacted to {data['messages']} messages")
-        elif event == "assistant_text" and data["text"].strip():
-            print(data["text"].strip())
-        elif event == "tool_start":
-            arguments = data["arguments"].replace("\n", " ")
-            if len(arguments) > 240:
-                arguments = arguments[:237] + "..."
-            print(f"  -> {data['name']} {arguments}")
-        elif event == "tool_end":
-            try:
-                result = json.loads(data["result"])
-                marker = "ok" if result.get("ok") else "error"
-                detail = result.get("error") or result.get("path") or result.get("exit_code")
-                print(f"  <- {marker}" + (f": {detail}" if detail is not None else ""))
-            except json.JSONDecodeError:
-                print("  <- invalid tool result")
-
-    @staticmethod
-    def approve(tool: str, summary: str) -> bool:
-        answer = input(f"Approve {tool} {summary}? [y/N] ").strip().lower()
-        return answer in {"y", "yes"}
+from .session import SessionStore
+from .tui import Console, configure_terminal_encoding
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="rivet", description="A coding agent built without an agent framework"
+        prog="rivet", description="An interactive coding agent built without an agent framework"
     )
-    parser.add_argument("task", nargs="*", help="programming task; prompts interactively if omitted")
     parser.add_argument("-w", "--workspace", default=".", help="workspace root (default: current directory)")
     parser.add_argument("-m", "--model", help="model name; or set RIVET_MODEL")
     parser.add_argument("--base-url", help="OpenAI-compatible base URL")
@@ -62,14 +33,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_terminal_encoding()
     args = build_parser().parse_args(argv)
-    task = " ".join(args.task).strip()
-    if not task:
-        if not sys.stdin.isatty():
-            print("error: provide a task as an argument", file=sys.stderr)
-            return 2
-        print("Rivet coding agent. Describe a task; Ctrl+C to cancel.")
-        task = input("task> ").strip()
+    console = Console()
+    if not sys.stdin.isatty():
+        console.error("Interactive mode requires terminal input.")
+        return 2
 
     try:
         config = Config.from_env(
@@ -81,46 +50,111 @@ def main(argv: list[str] | None = None) -> int:
         )
         if config.base_url == "https://api.openai.com/v1" and not config.api_key:
             raise RivetError("RIVET_API_KEY or OPENAI_API_KEY is required for api.openai.com")
-        console = Console()
         agent = Agent(
             config,
             OpenAICompatibleClient(config),
             event_handler=console.event,
             approver=console.approve,
         )
-        result = agent.run(task)
-        session_path = save_session(config.workspace, task, result)
-        print(f"\n{'Completed' if result.success else 'Stopped'} in {result.steps} step(s).")
-        print(result.final)
-        print(f"Session: {session_path.relative_to(config.workspace)}")
-        return 0 if result.success else 1
+        return run_interactive(config, agent, console=console)
     except KeyboardInterrupt:
-        print("\nCancelled.", file=sys.stderr)
+        console.error("Cancelled.")
         return 130
     except RivetError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        console.error(str(exc))
         return 2
 
 
-def save_session(workspace: Path, task: str, result: AgentResult) -> Path:
-    session_dir = workspace / ".rivet" / "sessions"
-    session_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    target = session_dir / f"{timestamp}.json"
-    suffix = 1
-    while target.exists():
-        target = session_dir / f"{timestamp}-{suffix}.json"
-        suffix += 1
-    payload = {
-        "task": task,
-        "success": result.success,
-        "reason": result.reason,
-        "steps": result.steps,
-        "final": result.final,
-        "messages": list(result.messages),
-    }
-    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return target
+def run_interactive(
+    config: Config,
+    agent: Agent,
+    *,
+    console: Console | None = None,
+    input_fn: Callable[[str], str] = input,
+) -> int:
+    """Run a persistent terminal conversation until the user exits or sends EOF."""
+    console = console or Console()
+    sessions = SessionStore(config.workspace, model=config.model)
+    session_path: Path | None = None
+    console.banner(config)
+
+    while True:
+        try:
+            user_input = input_fn(console.prompt()).strip()
+        except KeyboardInterrupt:
+            console.input_cancelled()
+            continue
+        except EOFError:
+            console.goodbye()
+            return 0
+
+        if not user_input:
+            continue
+        if user_input.startswith("/"):
+            command, _, argument = user_input.partition(" ")
+            command = command.lower()
+            argument = argument.strip()
+            if command in {"/exit", "/quit"}:
+                console.goodbye()
+                return 0
+            if command == "/help":
+                console.help()
+                continue
+            if command == "/new":
+                agent.reset()
+                session_path = None
+                console.notice("Started a new conversation.")
+                continue
+            if command == "/sessions":
+                console.sessions(sessions.list_sessions())
+                continue
+            if command == "/resume":
+                try:
+                    loaded = sessions.load(argument or None)
+                    drifted = agent.restore_session_state(loaded.agent_state)
+                    session_path = loaded.summary.path
+                    console.session_resumed(loaded.summary, drifted)
+                    if loaded.summary.model not in {"legacy", config.model}:
+                        console.warning(
+                            f"Saved model was {loaded.summary.model}; continuing with {config.model}."
+                        )
+                except RivetError as exc:
+                    console.error(str(exc))
+                continue
+            if command == "/status":
+                console.status(agent.status())
+                continue
+            if command == "/diff":
+                try:
+                    console.diff(agent.show_diff(argument or None), argument or None)
+                except RivetError as exc:
+                    console.error(str(exc))
+                continue
+            console.warning(f"Unknown command: {command}. Type /help for available commands.")
+            continue
+
+        result = agent.run(user_input)
+        first_save = session_path is None
+        try:
+            session_path = sessions.save(agent, result, target=session_path)
+        except RivetError as exc:
+            console.error(f"Session was not saved: {exc}")
+        console.turn_result(result, agent.turns)
+        if first_save and session_path is not None:
+            console.session_saved(session_path.relative_to(config.workspace))
+
+
+def save_conversation(
+    workspace: Path,
+    agent: Agent,
+    result: AgentResult,
+    *,
+    target: Path | None = None,
+) -> Path:
+    """Compatibility wrapper for callers of the earlier transcript exporter."""
+    return SessionStore(workspace, model=agent.config.model).save(
+        agent, result, target=target
+    )
 
 
 if __name__ == "__main__":
