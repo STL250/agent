@@ -128,6 +128,7 @@ class Console:
             file=self.output,
         )
         print(f"{self.glyph('side')}  model      {config.model}", file=self.output)
+        print(f"{self.glyph('side')}  protocol   {config.protocol}", file=self.output)
         print(f"{self.glyph('side')}  workspace  {config.workspace}", file=self.output)
         print(f"{self.glyph('side')}  approval   {config.approval_mode}", file=self.output)
         print(

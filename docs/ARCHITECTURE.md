@@ -9,10 +9,10 @@ framework and no server-hosted file or execution tool.
 ```text
 repeated user turns
         |
-      Agent -------- ContextManager ---- tool schemas ----> OpenAICompatibleClient
+      Agent -------- ContextManager ---- tool schemas ----> ModelClient
         ^  ^               ^                                     |
         |  |               |                                     v
- PlanState |         tool result <---- ReAct loop <---- assistant text / tool_calls
+ PlanState |         tool result <---- ReAct loop <---- normalized model reply
         ^  |
         | SessionStore
         |  ^
@@ -20,7 +20,7 @@ repeated user turns
         +- versioned JSON
                            ^                 |
                            |                 v
-                     ToolRegistry ---- Workspace ---- local files and subprocesses
+                ClientFactory     ToolRegistry ---- Workspace ---- local files and subprocesses
 ```
 
 The loop is implemented in `src/rivet/agent.py`. `Agent` owns the message history, tool
@@ -37,16 +37,40 @@ clearing conversation state and creating a fresh tool/diff boundary.
 | Requirement | Implementation |
 | --- | --- |
 | Conversation/session | `Agent` retains user turns, assistant messages, tool results, diff baseline, and execution evidence |
+| Provider configuration | `Config` resolves CLI, process environment, `.env`, endpoints, authentication, and bounded extensions |
+| Protocol selection | `ClientFactory` creates a `ModelClient`; provider names never enter the Agent loop |
 | Task planning | `PlanState` validates explicit step status and exposes it through `update_plan`, `/plan`, and TUI events |
 | Session persistence | `SessionStore` atomically saves and validates versioned, workspace-scoped state |
 | Context bounding | `ContextManager` preserves the system prompt, first task, recent call-result units, and a deterministic checkpoint |
 | Terminal presentation | `Console` in `tui.py` renders compact semantic events with ANSI and plain-text modes |
 | Tool definitions | Eight JSON-schema function tools in `ToolRegistry` with local validation |
 | Local execution | `Workspace` reads, searches, atomically edits, and runs bounded subprocesses |
-| Output parsing | `OpenAICompatibleClient` validates JSON replies or incrementally rebuilds SSE text and indexed tool-call deltas |
+| Output parsing | `OpenAICompatibleClient` validates JSON replies, rebuilds SSE/tool deltas, and retains configured replay fields |
 | Completion evidence | `TaskState` records inspected/changed files and command outcomes; edits require a later successful check |
 | Termination | Verified final text, max steps, two empty replies, or three identical call-result observations |
 | Error handling | Structured tool errors, HTTP retry/backoff, timeouts, truncation, and secret redaction |
+
+## Model provider boundary
+
+The Agent depends only on the small `ModelClient` protocol. `ClientFactory` selects a protocol
+adapter from validated configuration, so model brands do not appear in the ReAct loop. The
+current `openai_chat` adapter works with services that implement Chat Completions, SSE, and
+function tools. A genuinely different wire protocol can be added as another adapter without
+changing planning, tools, session persistence, or the terminal interface.
+
+Configuration follows `command line > process environment > .env > defaults`. The built-in
+`.env` reader does not mutate the process environment or perform shell expansion. It supports
+a complete endpoint or a base URL plus path, bearer/raw API-key/no authentication, bounded
+provider request JSON, service headers, and a list of assistant response fields that must be
+replayed on later requests. Core message, tool, stream, and HTTP content-negotiation fields
+cannot be replaced by provider extensions. Credentials and header values are redacted from
+diagnostics and errors.
+
+Some reasoning-capable APIs require fields such as `reasoning_content` from an assistant tool
+call to be sent back with the later tool result. The protocol adapter captures only configured
+replay fields, keeps them in the normalized assistant message, and never sends them to the TUI
+as visible answer text. `rivet --check-model` exercises a streamed reply, a function call, and
+a tool-result follow-up against the selected endpoint before an interactive session starts.
 
 ## Tools
 
@@ -107,10 +131,12 @@ This stops genuine no-progress loops while allowing a repeated read whose conten
 
 `OpenAICompatibleClient.complete_stream()` requests Chat Completions SSE. Text from
 `delta.content` is forwarded immediately, while `delta.tool_calls` fragments are accumulated
-by their numeric index; IDs, function names, and JSON argument strings are validated only
-after the stream completes. Empty usage chunks are ignored, `[DONE]` and finish reasons close
-the stream, and a truncated or malformed stream fails explicitly. A compatible gateway that
-rejects streaming before emitting any content is retried through the existing JSON request.
+by their numeric index. Configured replay-field strings, arrays, and object fragments are
+accumulated separately and never rendered. IDs, function names, and JSON argument strings are
+validated only after the stream completes. Empty usage chunks and SSE keep-alive comments are
+ignored, `[DONE]` and finish reasons close the stream, and a truncated or malformed stream
+fails explicitly. A compatible gateway that rejects streaming before emitting any content is
+retried through the existing JSON request.
 
 The Agent does not append an assistant message until a model stream is complete. `Ctrl+C`
 during a request discards partial text and records a short cancellation marker instead. If a
@@ -170,10 +196,11 @@ ends survive.
 
 ## Security boundary and trade-offs
 
-Path tools resolve symlinks and reject locations outside the selected workspace. API keys
-are sent only in the model HTTP header, never logged, and credential-shaped environment
-variables are removed from subprocesses. `safe`, `ask`, and read-only `never` approval
-modes make the write boundary visible.
+Path tools resolve symlinks and reject locations outside the selected workspace. `.env` and
+session state are ignored by Git. API keys are sent only in the configured model HTTP header,
+never logged, and credentials plus custom header values are redacted from endpoint errors.
+Credential-shaped environment variables are removed from subprocesses. `safe`, `ask`, and
+read-only `never` approval modes make the write boundary visible.
 
 `run_command` is intentionally capable and is not an OS sandbox. Destructive commands remain
 blocked, while package installation, network access, and Git history/branch mutations require

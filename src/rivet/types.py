@@ -22,6 +22,7 @@ class ModelReply:
     content: str
     tool_calls: tuple[ToolCall, ...] = ()
     raw_message: Message = field(default_factory=dict)
+    extensions: JsonObject = field(default_factory=dict)
 
 
 class ModelClient(Protocol):

@@ -7,9 +7,10 @@ from typing import Callable
 
 from . import __version__
 from .agent import Agent, AgentResult
-from .client import OpenAICompatibleClient
 from .config import Config
+from .diagnostics import run_model_check
 from .errors import RivetError
+from .provider import create_model_client
 from .session import SessionStore
 from .tui import Console, configure_terminal_encoding
 
@@ -21,12 +22,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-w", "--workspace", default=".", help="workspace root (default: current directory)")
     parser.add_argument("-m", "--model", help="model name; or set RIVET_MODEL")
     parser.add_argument("--base-url", help="OpenAI-compatible base URL")
+    parser.add_argument("--endpoint", help="complete chat-completions endpoint URL")
+    parser.add_argument(
+        "--protocol", help="model API protocol (currently: openai_chat)"
+    )
+    parser.add_argument(
+        "--auth-style", choices=("bearer", "api-key", "none"), help="API authentication style"
+    )
+    parser.add_argument(
+        "--env-file", help="configuration file (default: .env in the launch directory)"
+    )
     parser.add_argument("--max-steps", type=int, help="maximum model turns")
     parser.add_argument(
         "--approval",
         choices=("safe", "ask", "never"),
-        default="safe",
+        default=None,
         help="safe=auto safe operations, ask=confirm mutations, never=read-only",
+    )
+    parser.add_argument(
+        "--check-model",
+        action="store_true",
+        help="test streaming and a function-tool round trip, then exit",
     )
     parser.add_argument("--version", action="version", version=f"Rivet {__version__}")
     return parser
@@ -36,7 +52,7 @@ def main(argv: list[str] | None = None) -> int:
     configure_terminal_encoding()
     args = build_parser().parse_args(argv)
     console = Console()
-    if not sys.stdin.isatty():
+    if not args.check_model and not sys.stdin.isatty():
         console.error("Interactive mode requires terminal input.")
         return 2
 
@@ -47,12 +63,17 @@ def main(argv: list[str] | None = None) -> int:
             base_url=args.base_url,
             max_steps=args.max_steps,
             approval_mode=args.approval,
+            protocol=args.protocol,
+            endpoint_url=args.endpoint,
+            auth_style=args.auth_style,
+            env_file=args.env_file,
         )
-        if config.base_url == "https://api.openai.com/v1" and not config.api_key:
-            raise RivetError("RIVET_API_KEY or OPENAI_API_KEY is required for api.openai.com")
+        client = create_model_client(config)
+        if args.check_model:
+            return run_model_check(config, client)
         agent = Agent(
             config,
-            OpenAICompatibleClient(config),
+            client,
             event_handler=console.event,
             approver=console.approve,
         )

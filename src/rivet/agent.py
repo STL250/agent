@@ -354,7 +354,9 @@ class Agent:
                 reply, streamed = self._complete_model(context.messages, step, turn)
             except KeyboardInterrupt:
                 return self._cancelled_result(context, state, step, turn, "model request")
-            assistant_message = self._assistant_message(reply.content, reply.tool_calls)
+            assistant_message = self._assistant_message(
+                reply.content, reply.tool_calls, reply.extensions
+            )
             context.append(assistant_message)
 
             if reply.content.strip():
@@ -713,8 +715,16 @@ class Agent:
         return hashlib.sha256(material).hexdigest()
 
     @staticmethod
-    def _assistant_message(content: str, calls: tuple[ToolCall, ...]) -> Message:
+    def _assistant_message(
+        content: str,
+        calls: tuple[ToolCall, ...],
+        extensions: JsonObject | None = None,
+    ) -> Message:
         message: Message = {"role": "assistant", "content": content or None}
+        if extensions:
+            for name, value in extensions.items():
+                if name not in {"role", "content", "tool_calls"}:
+                    message[name] = value
         if calls:
             message["tool_calls"] = [
                 {

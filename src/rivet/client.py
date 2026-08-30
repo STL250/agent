@@ -21,7 +21,7 @@ class OpenAICompatibleClient:
     def __init__(self, config: Config, *, retries: int = 3) -> None:
         self.config = config
         self.retries = retries
-        self.endpoint = config.base_url + "/chat/completions"
+        self.endpoint = config.endpoint
 
     def complete(self, messages: list[Message], tools: list[JsonObject]) -> ModelReply:
         payload = self._request_payload(messages, tools, stream=False)
@@ -106,23 +106,28 @@ class OpenAICompatibleClient:
         self, messages: list[Message], tools: list[JsonObject], *, stream: bool
     ) -> JsonObject:
         payload: JsonObject = {
+            **self.config.extra_body,
             "model": self.config.model,
             "messages": messages,
-            "tools": tools,
-            "tool_choice": "auto",
         }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
         if stream:
             payload["stream"] = True
         return payload
 
     def _headers(self, *, stream: bool) -> dict[str, str]:
         headers = {
+            **self.config.extra_headers,
             "Content-Type": "application/json",
             "Accept": "text/event-stream" if stream else "application/json",
-            "User-Agent": "rivet-code-agent/1.4",
+            "User-Agent": "rivet-code-agent/1.5",
         }
-        if self.config.api_key:
+        if self.config.auth_style == "bearer" and self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
+        elif self.config.auth_style == "api-key" and self.config.api_key:
+            headers[self.config.api_key_header] = self.config.api_key
         return headers
 
     def _retry_http_error(self, exc: urllib.error.HTTPError, attempt: int) -> bool:
@@ -146,7 +151,8 @@ class OpenAICompatibleClient:
         choices = payload.get("choices")
         if not isinstance(choices, list) or not choices:
             error = payload.get("error")
-            raise ModelError(f"model response has no choices: {self._sanitize(str(error or 'unknown error'))}")
+            detail = self._sanitize(str(error or "unknown error"))
+            raise ModelError(f"model response has no choices: {detail}")
         message = choices[0].get("message") if isinstance(choices[0], dict) else None
         if not isinstance(message, dict):
             raise ModelError("model response has no assistant message")
@@ -177,14 +183,28 @@ class OpenAICompatibleClient:
             parsed_calls.append(ToolCall(call_id, name, arguments))
 
         normalized: Message = {"role": "assistant", "content": content or None}
+        extensions: JsonObject = {}
+        for field in self.config.replay_fields:
+            if field not in message or message[field] is None:
+                continue
+            value = message[field]
+            try:
+                encoded_value = json.dumps(value, ensure_ascii=False)
+            except (TypeError, ValueError) as exc:
+                raise ModelError(f"assistant {field} is not JSON-compatible") from exc
+            if len(encoded_value) > 2_000_000:
+                raise ModelError(f"assistant {field} exceeds the replay size limit")
+            extensions[field] = value
+            normalized[field] = value
         if raw_calls:
             normalized["tool_calls"] = raw_calls
-        return ModelReply(content, tuple(parsed_calls), normalized)
+        return ModelReply(content, tuple(parsed_calls), normalized, extensions)
 
     def _parse_event_stream(
         self, response: BinaryIO, on_text_delta: TextDeltaHandler
     ) -> ModelReply:
         content_parts: list[str] = []
+        extension_values: JsonObject = {}
         tool_parts: dict[int, dict[str, str]] = {}
         data_lines: list[str] = []
         saw_choice = False
@@ -235,6 +255,10 @@ class OpenAICompatibleClient:
                 if content:
                     content_parts.append(content)
                     on_text_delta(content)
+            for field in self.config.replay_fields:
+                value = delta.get(field)
+                if value is not None:
+                    self._merge_extension_delta(extension_values, field, value)
             self._merge_tool_deltas(tool_parts, delta.get("tool_calls"))
             if choice.get("finish_reason") is not None:
                 finished = True
@@ -277,13 +301,37 @@ class OpenAICompatibleClient:
                     },
                 }
             )
-        return self._parse_message(
-            {
-                "role": "assistant",
-                "content": "".join(content_parts) or None,
-                "tool_calls": raw_calls,
-            }
-        )
+        message: JsonObject = {
+            "role": "assistant",
+            "content": "".join(content_parts) or None,
+            "tool_calls": raw_calls,
+        }
+        message.update(extension_values)
+        return self._parse_message(message)
+
+    @staticmethod
+    def _merge_extension_delta(target: JsonObject, field: str, value: Any) -> None:
+        """Rebuild common JSON delta shapes without knowing a provider's field names."""
+        try:
+            json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            raise ModelError(f"model stream {field} delta is not JSON-compatible") from exc
+
+        if field not in target:
+            target[field] = value
+        else:
+            previous = target[field]
+            if isinstance(previous, str) and isinstance(value, str):
+                target[field] = previous + value
+            elif isinstance(previous, list) and isinstance(value, list):
+                previous.extend(value)
+            elif isinstance(previous, dict) and isinstance(value, dict):
+                previous.update(value)
+            elif previous != value:
+                raise ModelError(f"model stream {field} changed delta shape")
+
+        if len(json.dumps(target[field], ensure_ascii=False)) > 2_000_000:
+            raise ModelError(f"model stream {field} exceeds the replay size limit")
 
     @staticmethod
     def _merge_tool_deltas(
@@ -345,5 +393,8 @@ class OpenAICompatibleClient:
         sanitized = text.replace("\r", " ").replace("\n", " ")[:1_500]
         if self.config.api_key:
             sanitized = sanitized.replace(self.config.api_key, "[REDACTED]")
+        for value in self.config.extra_headers.values():
+            if value:
+                sanitized = sanitized.replace(value, "[REDACTED]")
         return sanitized
 
