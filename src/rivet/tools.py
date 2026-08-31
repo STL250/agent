@@ -13,6 +13,7 @@ from .workspace import Workspace
 
 
 Approver = Callable[[str, str], bool]
+DelegateHandler = Callable[..., JsonObject]
 
 
 @dataclass(frozen=True)
@@ -43,9 +44,13 @@ class ToolRegistry:
         plan: PlanState | None = None,
         event_handler: EventHandler | None = None,
         cancel_event: threading.Event | None = None,
+        workspace: Workspace | None = None,
+        tool_scope: str = "full",
+        delegate_handler: DelegateHandler | None = None,
+        delegate_many_handler: DelegateHandler | None = None,
     ) -> None:
         self.config = config
-        self.workspace = Workspace(
+        self.workspace = workspace or Workspace(
             config.workspace,
             max_output_chars=config.max_tool_output_chars,
             cancel_event=cancel_event,
@@ -53,7 +58,16 @@ class ToolRegistry:
         self.approver = approver
         self.plan = plan if plan is not None else PlanState()
         self.events = event_handler or (lambda _event, _data: None)
-        self._tools = {tool.name: tool for tool in self._build_tools()}
+        if tool_scope not in {"full", "read_only"}:
+            raise ValueError(f"unsupported tool scope: {tool_scope}")
+        self.tool_scope = tool_scope
+        self.delegate_handler = delegate_handler
+        self.delegate_many_handler = delegate_many_handler
+        tools = self._build_tools()
+        if tool_scope == "read_only":
+            allowed = {"update_plan", "list_files", "read_file", "search_text", "show_diff"}
+            tools = tuple(tool for tool in tools if tool.name in allowed)
+        self._tools = {tool.name: tool for tool in tools}
 
     @property
     def schemas(self) -> list[JsonObject]:
@@ -213,7 +227,7 @@ class ToolRegistry:
 
     def _build_tools(self) -> tuple[ToolSpec, ...]:
         object_schema = {"type": "object", "additionalProperties": False}
-        return (
+        tools = [
             ToolSpec(
                 "update_plan",
                 "Create or update a concise progress plan for a multi-stage task. "
@@ -378,7 +392,79 @@ class ToolRegistry:
                 ),
                 mutating=True,
             ),
-        )
+        ]
+        if self.delegate_handler is not None:
+            tools.append(
+                ToolSpec(
+                    "delegate_task",
+                    "Delegate one bounded specialist task to an isolated sub-agent and return "
+                    "a structured evidence report. Use explore or review for read-only work; "
+                    "use implement only when the sub-agent must edit files.",
+                    {
+                        **object_schema,
+                        "properties": {
+                            "task": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 12000,
+                            },
+                            "mode": {
+                                "type": "string",
+                                "enum": ["explore", "implement", "review"],
+                            },
+                            "label": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 80,
+                            },
+                        },
+                        "required": ["task", "mode"],
+                    },
+                    self.delegate_handler,
+                )
+            )
+        if self.delegate_many_handler is not None:
+            tools.append(
+                ToolSpec(
+                    "delegate_readonly_tasks",
+                    "Run two or three independent read-only exploration or review assignments "
+                    "in parallel and return one structured report per sub-agent.",
+                    {
+                        **object_schema,
+                        "properties": {
+                            "tasks": {
+                                "type": "array",
+                                "minItems": 2,
+                                "maxItems": 3,
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "task": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": 12000,
+                                        },
+                                        "mode": {
+                                            "type": "string",
+                                            "enum": ["explore", "review"],
+                                        },
+                                        "label": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": 80,
+                                        },
+                                    },
+                                    "required": ["task", "mode"],
+                                },
+                            }
+                        },
+                        "required": ["tasks"],
+                    },
+                    self.delegate_many_handler,
+                )
+            )
+        return tuple(tools)
 
     def _update_plan(
         self, steps: list[JsonObject], explanation: str = ""

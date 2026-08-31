@@ -132,6 +132,15 @@ def _positive_int(settings: _Settings, name: str, default: int) -> int:
     return value
 
 
+def _bounded_positive_int(
+    settings: _Settings, name: str, default: int, maximum: int
+) -> int:
+    value = _positive_int(settings, name, default)
+    if value > maximum:
+        raise ConfigurationError(f"{name} must not exceed {maximum}")
+    return value
+
+
 def _json_object(name: str, raw: str | None) -> JsonObject:
     if raw is None:
         return {}
@@ -233,6 +242,9 @@ class Config:
     extra_headers: dict[str, str] = field(default_factory=dict)
     replay_fields: tuple[str, ...] = ("reasoning_content",)
     env_file: Path | None = None
+    subagent_max_steps: int = 12
+    max_subagents_per_turn: int = 4
+    subagent_parallelism: int = 3
 
     @property
     def endpoint(self) -> str:
@@ -332,6 +344,15 @@ class Config:
             ),
             max_tool_output_chars=_positive_int(
                 settings, "RIVET_MAX_TOOL_OUTPUT_CHARS", 20_000
+            ),
+            subagent_max_steps=_bounded_positive_int(
+                settings, "RIVET_SUBAGENT_MAX_STEPS", 12, 100
+            ),
+            max_subagents_per_turn=_bounded_positive_int(
+                settings, "RIVET_MAX_SUBAGENTS_PER_TURN", 4, 16
+            ),
+            subagent_parallelism=_bounded_positive_int(
+                settings, "RIVET_SUBAGENT_PARALLELISM", 3, 3
             ),
             approval_mode=chosen_approval,
             protocol=chosen_protocol,

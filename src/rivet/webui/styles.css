@@ -1457,6 +1457,86 @@ kbd {
   flex-direction: column;
 }
 
+.subagent-section {
+  margin-bottom: 24px;
+  padding-bottom: 22px;
+  border-bottom: 1px solid var(--border);
+}
+
+.subagent-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 11px;
+  color: var(--ink-faint);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+}
+
+.subagent-list {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.subagent-card {
+  padding: 12px 13px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border-strong);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.55);
+}
+
+.subagent-card.running { border-left-color: var(--info); }
+.subagent-card.completed { border-left-color: var(--success); }
+.subagent-card.failed,
+.subagent-card.cancelled { border-left-color: var(--danger); }
+
+.subagent-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.subagent-card-header strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 620;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subagent-card-header span {
+  flex: 0 0 auto;
+  color: var(--ink-faint);
+  font-size: 10px;
+}
+
+.subagent-card.running .subagent-card-header span {
+  color: var(--info);
+}
+
+.subagent-card-meta {
+  margin-top: 4px;
+  color: var(--ink-faint);
+  font-size: 10px;
+}
+
+.subagent-card p {
+  display: -webkit-box;
+  margin: 8px 0 0;
+  overflow: hidden;
+  color: var(--ink-soft);
+  font-size: 11px;
+  line-height: 1.5;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
 .activity-item {
   position: relative;
   padding: 0 0 22px 22px;
@@ -1490,6 +1570,7 @@ kbd {
 .activity-item.success::before { background: var(--success); }
 .activity-item.warning::before { background: var(--warning); }
 .activity-item.error::before { background: var(--danger); }
+.activity-item.subagent::before { background: #766aa8; }
 
 .activity-item strong,
 .activity-item span {

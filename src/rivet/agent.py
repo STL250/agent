@@ -5,15 +5,17 @@ import hashlib
 import json
 import threading
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from .config import Config
 from .context import ContextManager
 from .errors import OperationCancelled, SessionError
 from .plan import PlanState
 from .prompt import system_prompt
+from .subagents import SubAgentManager
 from .tools import Approver, ToolRegistry
 from .types import EventHandler, JsonObject, Message, ModelClient, ModelReply, ToolCall
+from .workspace import Workspace
 
 
 @dataclass
@@ -132,6 +134,33 @@ class TaskState:
                 and not command_record["cancelled"]
             ):
                 self.last_successful_command_operation = self.operation_index
+        elif name in {"delegate_task", "delegate_readonly_tasks"}:
+            reports = payload.get("reports") if name == "delegate_readonly_tasks" else [payload]
+            if not isinstance(reports, list):
+                return
+            changed_reports: list[JsonObject] = []
+            for report in reports:
+                if not isinstance(report, dict):
+                    continue
+                if report.get("tracking_complete") is False:
+                    self.workspace_tracking_complete = False
+                changed = report.get("changed_files", [])
+                if not isinstance(changed, list):
+                    continue
+                report_changed = [item for item in changed if isinstance(item, str)]
+                if report_changed:
+                    self.changed_files.update(report_changed)
+                    changed_reports.append(report)
+            if changed_reports:
+                self.last_mutation_operation = self.operation_index
+                all_verified = all(
+                    isinstance(report.get("verification"), dict)
+                    and report["verification"].get("passed") is True
+                    for report in changed_reports
+                )
+                if all_verified:
+                    self.operation_index += 1
+                    self.last_successful_command_operation = self.operation_index
 
     @property
     def verification_required(self) -> bool:
@@ -193,12 +222,25 @@ class Agent:
         *,
         event_handler: EventHandler | None = None,
         approver: Approver | None = None,
+        client_factory: Callable[[], ModelClient] | None = None,
+        workspace: Workspace | None = None,
+        tool_scope: str = "full",
+        enable_delegation: bool = True,
+        cancel_event: threading.Event | None = None,
+        system_prompt_text: str | None = None,
     ) -> None:
         self.config = config
         self.client = client
+        self._parallel_delegation = client_factory is not None
+        self.client_factory = client_factory or (lambda: self.client)
         self.events = event_handler or (lambda _event, _data: None)
         self.approver = approver
-        self._cancel_event = threading.Event()
+        self._shared_workspace = workspace
+        self._tool_scope = tool_scope
+        self._enable_delegation = enable_delegation
+        self._cancel_event = cancel_event or threading.Event()
+        self._owns_cancel_event = cancel_event is None
+        self._system_prompt = system_prompt_text or system_prompt(self.config.workspace)
         self._run_state_lock = threading.Lock()
         self._running = False
         self.reset()
@@ -206,13 +248,12 @@ class Agent:
     def reset(self) -> None:
         """Start a new conversation and a new in-memory workspace diff baseline."""
         self.plan = PlanState()
-        self.tools = ToolRegistry(
-            self.config,
-            approver=self.approver,
-            plan=self.plan,
-            event_handler=self.events,
+        workspace = self._shared_workspace or Workspace(
+            self.config.workspace,
+            max_output_chars=self.config.max_tool_output_chars,
             cancel_event=self._cancel_event,
         )
+        self.tools, self.subagents = self._build_runtime(self.plan, workspace)
         self.context: ContextManager | None = None
         self.state = TaskState()
         self.tasks: list[str] = []
@@ -232,6 +273,10 @@ class Agent:
             "total_steps": self.total_steps,
             "messages": len(self.messages),
             "plan": self.plan.snapshot(),
+            "subagents": self.subagents.snapshot() if self.subagents else {
+                "active": [],
+                "history": [],
+            },
             **self.state.snapshot(),
         }
 
@@ -252,6 +297,7 @@ class Agent:
             "plan_state": self.plan.export_state(),
             "task_state": self.state.export_state(),
             "workspace_state": self.tools.workspace.export_diff_state(),
+            "subagent_state": self.subagents.export_state() if self.subagents else None,
         }
 
     def restore_session_state(self, payload: Any) -> list[str]:
@@ -276,30 +322,33 @@ class Agent:
             raise SessionError("saved conversation must be a list")
 
         restored_context = ContextManager.restore(
-            system_prompt(self.config.workspace),
+            self._system_prompt,
             conversation,
             self.config.max_context_chars,
         )
         restored_plan = PlanState.restore(payload.get("plan_state"))
         restored_state = TaskState.restore(payload.get("task_state"))
-        restored_tools = ToolRegistry(
-            self.config,
-            approver=self.approver,
-            plan=restored_plan,
-            event_handler=self.events,
+        restored_workspace = Workspace(
+            self.config.workspace,
+            max_output_chars=self.config.max_tool_output_chars,
             cancel_event=self._cancel_event,
         )
         try:
-            drifted = restored_tools.workspace.restore_diff_state(
-                payload.get("workspace_state")
-            )
+            drifted = restored_workspace.restore_diff_state(payload.get("workspace_state"))
         except Exception as exc:
             if isinstance(exc, SessionError):
                 raise
             raise SessionError(f"saved workspace state is invalid: {exc}") from exc
         restored_state.record_external_changes(drifted)
 
+        restored_tools, restored_subagents = self._build_runtime(
+            restored_plan, restored_workspace
+        )
+        if restored_subagents is not None:
+            restored_subagents.restore_state(payload.get("subagent_state"))
+
         self.tools = restored_tools
+        self.subagents = restored_subagents
         self.plan = restored_plan
         self.context = restored_context
         self.state = restored_state
@@ -314,11 +363,14 @@ class Agent:
         with self._run_state_lock:
             if self._running:
                 raise RuntimeError("agent is already running")
-            self._cancel_event.clear()
+            if self._owns_cancel_event:
+                self._cancel_event.clear()
             reset_cancel = getattr(self.client, "reset_cancel", None)
             if callable(reset_cancel):
                 reset_cancel()
             self._running = True
+            if self.subagents is not None:
+                self.subagents.begin_turn()
         try:
             return self._run_turn(task)
         finally:
@@ -334,6 +386,8 @@ class Agent:
         cancel_client = getattr(self.client, "cancel", None)
         if callable(cancel_client):
             cancel_client()
+        if self.subagents is not None:
+            self.subagents.cancel_active()
         return True
 
     def _run_turn(self, task: str) -> AgentResult:
@@ -352,7 +406,7 @@ class Agent:
             self.plan.clear()
         if self.context is None:
             self.context = ContextManager(
-                system_prompt(self.config.workspace),
+                self._system_prompt,
                 normalized_task,
                 self.config.max_context_chars,
             )
@@ -705,7 +759,44 @@ class Agent:
         )
 
     def _result_state(self, state: TaskState) -> JsonObject:
-        return {**state.snapshot(), "plan": self.plan.snapshot()}
+        return {
+            **state.snapshot(),
+            "plan": self.plan.snapshot(),
+            "subagents": self.subagents.snapshot() if self.subagents else {
+                "active": [],
+                "history": [],
+            },
+        }
+
+    def _build_runtime(
+        self, plan: PlanState, workspace: Workspace
+    ) -> tuple[ToolRegistry, SubAgentManager | None]:
+        manager: SubAgentManager | None = None
+        if self._enable_delegation:
+            manager = SubAgentManager(
+                self.config,
+                self.client_factory,
+                workspace,
+                event_handler=self.events,
+                approver=self.approver,
+                cancel_event=self._cancel_event,
+            )
+        registry = ToolRegistry(
+            self.config,
+            approver=self.approver,
+            plan=plan,
+            event_handler=self.events,
+            cancel_event=self._cancel_event,
+            workspace=workspace,
+            tool_scope=self._tool_scope,
+            delegate_handler=manager.delegate if manager else None,
+            delegate_many_handler=(
+                manager.delegate_many
+                if manager and self._parallel_delegation
+                else None
+            ),
+        )
+        return registry, manager
 
     @staticmethod
     def _cancelled_tool_payload(name: str, *, skipped: bool = False) -> str:

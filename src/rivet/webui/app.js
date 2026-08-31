@@ -37,6 +37,9 @@ const ui = {
   verificationTitle: $("#verificationTitle"),
   verificationDetail: $("#verificationDetail"),
   activity: $("#activityList"),
+  subagentSection: $("#subagentSection"),
+  subagentCount: $("#subagentCount"),
+  subagentList: $("#subagentList"),
   approvalModal: $("#approvalModal"),
   approvalTool: $("#approvalTool"),
   approvalSummary: $("#approvalSummary"),
@@ -65,6 +68,7 @@ let currentDiffFiles = [];
 let activeDiffIndex = -1;
 let currentDiffTruncated = false;
 let followLatestMessage = true;
+const subagentState = new Map();
 
 async function request(path, options = {}) {
   const headers = new Headers(options.headers || {});
@@ -428,6 +432,8 @@ function toolLabel(name) {
     replace_text: "修改文件",
     show_diff: "检查改动",
     run_command: "运行命令",
+    delegate_task: "委派子 Agent",
+    delegate_readonly_tasks: "并行委派",
   };
   return labels[name] || name;
 }
@@ -507,8 +513,62 @@ function renderSnapshot(snapshot, { renderMessages = false } = {}) {
   ui.turnSummary.textContent = `${status.turns || 0} 轮 · ${status.total_steps || 0} 个步骤`;
   renderPlan(snapshot.plan || status.plan || {});
   renderChanges(status, snapshot.diff || {});
+  renderSubagentSnapshot(status.subagents || {});
   renderSessions(snapshot.sessions || [], snapshot.session_id);
   if (renderMessages) renderConversation(snapshot.conversation || []);
+}
+
+function renderSubagentSnapshot(snapshot) {
+  subagentState.clear();
+  const history = Array.isArray(snapshot.history) ? snapshot.history : [];
+  const active = Array.isArray(snapshot.active) ? snapshot.active : [];
+  for (const item of [...history, ...active]) {
+    if (item && item.agent_id) subagentState.set(item.agent_id, item);
+  }
+  renderSubagents();
+}
+
+function updateSubagent(data) {
+  if (!data || !data.agent_id) return;
+  const previous = subagentState.get(data.agent_id) || {};
+  subagentState.set(data.agent_id, { ...previous, ...data });
+  renderSubagents();
+}
+
+function renderSubagents() {
+  const items = [...subagentState.values()].slice(-8).reverse();
+  ui.subagentSection.hidden = items.length === 0;
+  ui.subagentCount.textContent = String(items.length);
+  ui.subagentList.replaceChildren();
+  const modeNames = { explore: "探索", implement: "实现", review: "审查" };
+  const statusNames = {
+    running: "执行中",
+    completed: "已完成",
+    failed: "失败",
+    cancelled: "已取消",
+  };
+  for (const item of items) {
+    const card = document.createElement("article");
+    card.className = `subagent-card ${item.status || "running"}`;
+    const header = document.createElement("div");
+    header.className = "subagent-card-header";
+    const title = document.createElement("strong");
+    title.textContent = item.label || item.agent_id || "子 Agent";
+    const badge = document.createElement("span");
+    badge.textContent = statusNames[item.status] || "执行中";
+    header.append(title, badge);
+    const meta = document.createElement("div");
+    meta.className = "subagent-card-meta";
+    const mode = modeNames[item.mode] || item.mode || "探索";
+    const progress = item.status === "running" && item.step ? ` · 第 ${item.step} 步` : "";
+    meta.textContent = `${mode}${progress}`;
+    const summary = document.createElement("p");
+    summary.textContent = item.status === "running"
+      ? item.tool ? `正在使用 ${toolLabel(item.tool)}` : "正在分析独立任务"
+      : item.summary || "已返回结构化报告";
+    card.append(header, meta, summary);
+    ui.subagentList.append(card);
+  }
 }
 
 function protocolLabel(protocol) {
@@ -698,6 +758,21 @@ function handleEvent(event, data) {
       break;
     case "tool_end":
       finishToolCard(data);
+      break;
+    case "subagent_started":
+      updateSubagent(data);
+      addActivity("子 Agent 已启动", `${data.label || data.agent_id} · ${data.mode}`, "subagent");
+      break;
+    case "subagent_progress":
+      updateSubagent(data);
+      break;
+    case "subagent_finished":
+      updateSubagent(data);
+      addActivity(
+        "子 Agent 已回报",
+        `${data.label || data.agent_id} · ${data.status || "completed"}`,
+        data.status === "completed" ? "success" : "error",
+      );
       break;
     case "plan_updated":
       renderPlan(data);

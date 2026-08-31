@@ -101,6 +101,7 @@ def main(argv: list[str] | None = None) -> int:
             client,
             event_handler=console.event,
             approver=console.approve,
+            client_factory=lambda: create_model_client(config),
         )
         return run_interactive(config, agent, console=console)
     except KeyboardInterrupt:

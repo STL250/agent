@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from .agent import Agent, AgentResult
 from .config import Config
 from .errors import ConfigurationError, RivetError
+from .provider import create_model_client
 from .session import SessionStore
 from .types import JsonObject, ModelClient
 
@@ -44,6 +45,7 @@ class WebRuntime:
             client,
             event_handler=self._agent_event,
             approver=self._approve,
+            client_factory=lambda: create_model_client(config),
         )
 
     def snapshot(self) -> JsonObject:

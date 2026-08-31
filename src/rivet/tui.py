@@ -60,6 +60,8 @@ class Console:
         "replace_text": "Edit",
         "show_diff": "Diff",
         "run_command": "Run",
+        "delegate_task": "Delegate",
+        "delegate_readonly_tasks": "Parallel delegate",
     }
     UNICODE_GLYPHS = {
         "top": "┌─",
@@ -210,6 +212,34 @@ class Console:
             self._start_activity("Running", label, indent="    ")
         elif event == "tool_end":
             self._tool_result(data["name"], data["result"])
+        elif event == "subagent_started":
+            label = str(data.get("label") or data.get("agent_id") or "sub-agent")
+            mode = str(data.get("mode") or "explore")
+            prefix = self.style(self.glyph("arrow"), self.CYAN)
+            print(f"  {prefix} Sub-agent  {label} [{mode}]", file=self.output)
+            self._start_activity("Delegated", label, indent="    ")
+        elif event == "subagent_progress":
+            label = str(data.get("label") or data.get("agent_id") or "sub-agent")
+            step = data.get("step", 0)
+            tool = data.get("tool")
+            detail = f"{label} · step {step}"
+            if tool:
+                detail += f" · {self.TOOL_LABELS.get(str(tool), str(tool))}"
+            self._start_activity("Sub-agent", detail, indent="    ")
+        elif event == "subagent_finished":
+            ok = data.get("status") == "completed"
+            marker = self.style(
+                self.glyph("success") if ok else self.glyph("failure"),
+                self.GREEN if ok else self.RED,
+            )
+            label = str(data.get("label") or data.get("agent_id") or "sub-agent")
+            summary = self._truncate(
+                " ".join(str(data.get("summary") or "").split()), 140
+            )
+            print(
+                f"    {marker} {label}" + (f"  {summary}" if summary else ""),
+                file=self.output,
+            )
         elif event == "plan_updated":
             self.plan(data, title="Plan updated")
         elif event == "plan_completion_required":
@@ -313,6 +343,16 @@ class Console:
         else:
             plan_status = "none"
         print(f"  plan        {plan_status}", file=self.output)
+        subagents = status.get("subagents", {})
+        if isinstance(subagents, dict):
+            active = subagents.get("active", [])
+            history = subagents.get("history", [])
+            active_count = len(active) if isinstance(active, list) else 0
+            history_count = len(history) if isinstance(history, list) else 0
+            print(
+                f"  sub-agents  {active_count} active | {history_count} report(s)",
+                file=self.output,
+            )
 
     def plan(self, plan: JsonObject, *, title: str = "Plan") -> None:
         print(self.style(f"\n{title}", self.BOLD), file=self.output)
@@ -736,6 +776,14 @@ class Console:
             count = len(steps) if isinstance(steps, list) else 0
             explanation = cls._truncate(str(arguments.get("explanation") or ""), 80)
             return f"{count} step(s)" + (f" | {explanation}" if explanation else "")
+        if name == "delegate_task":
+            label = str(arguments.get("label") or arguments.get("mode") or "sub-agent")
+            task = cls._truncate(str(arguments.get("task") or ""), 90)
+            return f"{label} | {task}"
+        if name == "delegate_readonly_tasks":
+            tasks = arguments.get("tasks", [])
+            count = len(tasks) if isinstance(tasks, list) else 0
+            return f"{count} read-only sub-agent(s)"
         if name == "search_text":
             query = cls._truncate(str(arguments.get("query") or ""), 70)
             path = str(arguments.get("path") or ".")
@@ -779,6 +827,13 @@ class Console:
             steps = result.get("steps", [])
             count = len(steps) if isinstance(steps, list) else 0
             return f"{count} step(s)" + (" updated" if result.get("changed") else " unchanged")
+        if name == "delegate_task":
+            return (
+                f"{result.get('label', 'sub-agent')} | "
+                f"{result.get('status', 'returned')} | {result.get('steps', 0)} step(s)"
+            )
+        if name == "delegate_readonly_tasks":
+            return f"{result.get('report_count', 0)} report(s) returned"
         return str(result.get("path") or "done")
 
     def _text_block(self, speaker: str, text: str) -> None:

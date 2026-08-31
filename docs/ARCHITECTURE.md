@@ -13,7 +13,9 @@ repeated user turns
         ^  ^               ^                                     |
         |  |               |                                     v
  PlanState |         tool result <---- ReAct loop <---- normalized model reply
-        ^  |
+        ^  |                    |
+        |  |                    v
+        |  |             SubAgentManager ---- isolated child Agent(s)
         | SessionStore
         |  ^
         |  |
@@ -44,7 +46,8 @@ clearing conversation state and creating a fresh tool/diff boundary.
 | Context bounding | `ContextManager` preserves the system prompt, first task, recent call-result units, and a deterministic checkpoint |
 | Terminal presentation | `Console` in `tui.py` renders compact semantic events with ANSI and plain-text modes |
 | Browser presentation | `WebRuntime` streams the same semantic events to a local two-column chat workspace |
-| Tool definitions | Eight JSON-schema function tools in `ToolRegistry` with local validation |
+| Multi-agent orchestration | `SubAgentManager` creates bounded child Agents, enforces depth and mode limits, and returns structured reports |
+| Tool definitions | JSON-schema function tools in `ToolRegistry` with local validation and permission-scoped visibility |
 | Local execution | `Workspace` reads, searches, atomically edits, and runs bounded subprocesses |
 | Output parsing | `OpenAICompatibleClient` validates JSON replies, rebuilds SSE/tool deltas, and retains configured replay fields |
 | Completion evidence | `TaskState` records inspected/changed files and command outcomes; edits require a later successful check |
@@ -107,10 +110,37 @@ remotely accessible.
 - `run_command`: cancellable subprocess group in the workspace with timeout, bounded output,
   stripped credential variables, a blocklist for obviously destructive/external commands,
   and before/after workspace snapshots that detect indirect file changes.
+- `delegate_task`: one bounded exploration, implementation, or review assignment with an
+  isolated context and structured result.
+- `delegate_readonly_tasks`: two or three independent exploration/review assignments executed
+  concurrently with separate model clients.
 
 Tool schemas are sent to the model and enforced again by `ToolRegistry`. Required fields,
 unknown fields, scalar types, ranges, and string sizes are rejected before approval or local
 execution. Errors include a stable code, field name when relevant, and retryability hint.
+
+## Multi-agent orchestration
+
+`SubAgentManager` is invoked through ordinary tool calls, so delegation does not bypass the
+ReAct loop. A child receives a fresh `ContextManager`, a smaller step budget, a mode-specific
+system prompt, and the same workspace diff baseline. The parent receives only a bounded report
+containing status, summary, inspected files, command evidence, changed files, verification,
+and risks. Child transcripts are not copied into the parent's context.
+
+`explore` and `review` registries expose only planning, listing, reading, searching, and diff
+tools. `implement` exposes the normal workspace tools and inherits the user's approval mode.
+Children are created with delegation disabled, which fixes orchestration depth at one. A
+per-turn count prevents runaway fan-out; independent read-only tasks may use a bounded thread
+pool, while implementation remains single-assignment and serialized. Each parallel child gets
+its own protocol client so cancellation and streamed responses do not share HTTP state.
+
+All child Agents share the parent's `Workspace` object. This preserves the original text
+baseline when a child edits a file, so parent `/diff`, completion evidence, and session restore
+remain accurate. Verified child changes are represented as a mutation followed by successful
+verification in `TaskState`; unverified child changes keep the parent's completion gate open.
+The active child set and recent reports are available through `Agent.status()`, persisted with
+the session, and rendered as semantic status events in both interfaces. Cancelling the parent
+sets the shared cancellation event and closes every active child's model request.
 
 ## Task planning
 
