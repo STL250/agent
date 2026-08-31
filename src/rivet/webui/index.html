@@ -15,8 +15,10 @@
         <div class="brand-row">
           <div class="brand-mark" aria-hidden="true">
             <svg viewBox="0 0 24 24" fill="none">
-              <circle cx="12" cy="12" r="2.25" />
-              <path d="M12 3.75v4M12 16.25v4M3.75 12h4M16.25 12h4M6.2 6.2 9 9m6 6 2.8 2.8M17.8 6.2 15 9m-6 6-2.8 2.8" />
+              <path d="M12 3.75 19.25 7.9v8.2L12 20.25 4.75 16.1V7.9Z" />
+              <path d="m4.75 7.9 7.25 4.15 7.25-4.15" />
+              <path d="M12 12.05v8.2" />
+              <path d="m8.35 5.85 7.25 4.15v8.2" />
             </svg>
           </div>
           <div>
@@ -100,12 +102,6 @@
 
         <section class="conversation" id="conversation" aria-live="polite">
           <div class="empty-state" id="emptyState">
-            <div class="empty-symbol" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none">
-                <circle cx="12" cy="12" r="2.25" />
-                <path d="M12 3.75v4M12 16.25v4M3.75 12h4M16.25 12h4M6.2 6.2 9 9m6 6 2.8 2.8M17.8 6.2 15 9m-6 6-2.8 2.8" />
-              </svg>
-            </div>
             <h1>今天要推进什么？</h1>
             <p>描述目标，Rivet 会阅读当前项目、制定计划，并在完成修改后验证结果。</p>
           </div>
@@ -116,17 +112,17 @@
           <form class="composer" id="composerForm">
             <label class="sr-only" for="messageInput">输入任务</label>
             <textarea id="messageInput" rows="1" maxlength="100000" placeholder="描述你希望 Rivet 完成的任务…"></textarea>
+            <button class="send-button" id="sendButton" type="submit" aria-label="发送消息">
+              <svg class="send-icon send-arrow" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="m7 11 5-5 5 5" />
+                <path d="M12 18V6" />
+              </svg>
+              <svg class="send-icon stop-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <rect x="8" y="8" width="8" height="8" rx="1.25" />
+              </svg>
+            </button>
             <div class="composer-footer">
               <div class="composer-hint"><kbd>Enter</kbd> 发送 · <kbd>Shift</kbd> + <kbd>Enter</kbd> 换行</div>
-              <button class="send-button" id="sendButton" type="submit" aria-label="发送消息">
-                <svg class="send-icon send-arrow" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                  <path d="m7 11 5-5 5 5" />
-                  <path d="M12 18V6" />
-                </svg>
-                <svg class="send-icon stop-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                  <rect x="8" y="8" width="8" height="8" rx="1.25" />
-                </svg>
-              </button>
             </div>
           </form>
           <p class="local-note">仅在当前工作目录内运行 · 提交前请审阅代码改动</p>
@@ -153,7 +149,16 @@
         <div class="inspector-body">
           <section class="tab-panel active" id="planPanel" data-panel="plan" role="tabpanel">
             <div class="panel-empty" id="planEmpty">
-              <div class="panel-empty-icon">◇</div>
+              <div class="panel-empty-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none">
+                  <path d="m4.5 7 1.5 1.5L8.5 6" />
+                  <path d="M11 7h8" />
+                  <path d="m4.5 12 1.5 1.5 2.5-2.5" />
+                  <path d="M11 12h8" />
+                  <path d="m4.5 17 1.5 1.5 2.5-2.5" />
+                  <path d="M11 17h6" />
+                </svg>
+              </div>
               <strong>暂无任务计划</strong>
               <span>复杂任务开始后，步骤会显示在这里。</span>
             </div>

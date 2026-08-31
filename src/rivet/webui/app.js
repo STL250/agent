@@ -370,8 +370,9 @@ function addMessage(role, text, { streaming = false } = {}) {
   avatar.className = "message-avatar";
   if (role === "assistant") {
     avatar.innerHTML = `<svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <circle cx="12" cy="12" r="2.25"></circle>
-      <path d="M12 4.5v4M12 15.5v4M4.5 12h4M15.5 12h4M6.7 6.7 9.5 9.5m5 5 2.8 2.8M17.3 6.7l-2.8 2.8m-5 5-2.8 2.8"></path>
+      <path d="m9 6.5-5.5 5.5L9 17.5"></path>
+      <path d="m15 6.5 5.5 5.5-5.5 5.5"></path>
+      <path d="m13.75 4.5-3.5 15"></path>
     </svg>`;
   } else {
     avatar.textContent = "你";
