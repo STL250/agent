@@ -43,6 +43,7 @@ clearing conversation state and creating a fresh tool/diff boundary.
 | Session persistence | `SessionStore` atomically saves and validates versioned, workspace-scoped state |
 | Context bounding | `ContextManager` preserves the system prompt, first task, recent call-result units, and a deterministic checkpoint |
 | Terminal presentation | `Console` in `tui.py` renders compact semantic events with ANSI and plain-text modes |
+| Browser presentation | `WebRuntime` streams the same semantic events to a local two-column chat workspace |
 | Tool definitions | Eight JSON-schema function tools in `ToolRegistry` with local validation |
 | Local execution | `Workspace` reads, searches, atomically edits, and runs bounded subprocesses |
 | Output parsing | `OpenAICompatibleClient` validates JSON replies, rebuilds SSE/tool deltas, and retains configured replay fields |
@@ -71,6 +72,24 @@ call to be sent back with the later tool result. The protocol adapter captures o
 replay fields, keeps them in the normalized assistant message, and never sends them to the TUI
 as visible answer text. `rivet --check-model` exercises a streamed reply, a function call, and
 a tool-result follow-up against the selected endpoint before an interactive session starts.
+
+## Local web interface
+
+`rivet --web` starts a dependency-free HTTP server on `127.0.0.1` and opens a two-column chat
+workspace: saved sessions on the left and the active conversation in the center. Planning,
+changed files, verification state, and tool activity live in an on-demand inspector rather
+than competing with the primary conversation. The same `Agent`, `SessionStore`, tool registry,
+and approval policy are shared with the terminal interface.
+
+Model and tool events are returned as newline-delimited JSON over one streamed request. A
+mutating tool that needs confirmation emits an approval event and waits on a bounded local
+condition until the browser allows or rejects it. New-session, resume, status, and diff actions
+use small JSON endpoints. No provider credential is serialized to the browser.
+
+The server is intentionally local-only: it rejects non-loopback host/origin values, requires a
+random per-process request token, sends no CORS permission, and applies a restrictive content
+security policy. It is not a hosted control plane and does not make the selected workspace
+remotely accessible.
 
 ## Tools
 

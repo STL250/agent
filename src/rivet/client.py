@@ -122,7 +122,7 @@ class OpenAICompatibleClient:
             **self.config.extra_headers,
             "Content-Type": "application/json",
             "Accept": "text/event-stream" if stream else "application/json",
-            "User-Agent": "rivet-code-agent/1.5",
+            "User-Agent": "rivet-code-agent/1.6",
         }
         if self.config.auth_style == "bearer" and self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"

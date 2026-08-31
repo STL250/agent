@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rivet-code-agent"
-version = "1.5.0"
+version = "1.6.0"
 description = "A small coding agent built from first principles"
 readme = "README.txt"
 requires-python = ">=3.10"
@@ -19,4 +19,7 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+rivet = ["webui/*.html", "webui/*.css", "webui/*.js"]
 

@@ -4,5 +4,5 @@ from .agent import Agent, AgentResult
 from .config import Config
 
 __all__ = ["Agent", "AgentResult", "Config"]
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 

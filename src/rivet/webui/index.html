@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="rivet-token" content="__RIVET_TOKEN__">
+    <title>Rivet · Coding Agent</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell" id="appShell">
+      <aside class="sidebar" id="sidebar" aria-label="会话导航">
+        <div class="brand-row">
+          <div class="brand-mark" aria-hidden="true">R</div>
+          <div>
+            <div class="brand-name">Rivet</div>
+            <div class="brand-subtitle">Coding Agent</div>
+          </div>
+        </div>
+
+        <div class="workspace-context">
+          <svg class="workspace-folder-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M3.5 7.5v-2a2 2 0 0 1 2-2h4l2 2h7a2 2 0 0 1 2 2v1H3.5Z" />
+            <path d="M3.5 8.5h17l-1.4 8.4a2 2 0 0 1-2 1.6H5.9a2 2 0 0 1-2-1.7L3.5 8.5Z" />
+          </svg>
+          <div class="workspace-details">
+            <span class="workspace-label">工作目录</span>
+            <strong id="workspaceName">正在连接</strong>
+            <span id="workspacePath">本地工作目录</span>
+          </div>
+        </div>
+
+        <button class="new-session-button" id="newSessionButton" type="button">
+          <svg class="new-session-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M12 5H6.5a2 2 0 0 0-2 2v10.5a2 2 0 0 0 2 2H17a2 2 0 0 0 2-2V12" />
+            <path d="m14.5 5.5 4 4M13 11l1-4 3.5-3.5a1.4 1.4 0 0 1 2 2L16 9l-3 2Z" />
+          </svg>
+          新建会话
+        </button>
+
+        <div class="section-heading sessions-heading">
+          <span class="sessions-heading-copy">会话 <span class="session-count" id="sessionCount">0</span></span>
+          <button class="icon-button quiet" id="refreshSessionsButton" type="button" aria-label="刷新会话">↻</button>
+        </div>
+
+        <nav class="session-list" id="sessionList" aria-label="当前工作目录的会话">
+          <div class="skeleton session-skeleton"></div>
+          <div class="skeleton session-skeleton short"></div>
+        </nav>
+
+        <div class="sidebar-footer">
+          <div class="model-row">
+            <span class="status-dot" id="connectionDot"></span>
+            <span class="model-copy">
+              <strong id="modelName">读取模型配置</strong>
+              <span id="modelProtocol">正在连接</span>
+            </span>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main-panel">
+        <header class="topbar">
+          <div class="topbar-left">
+            <button class="icon-button panel-toggle" id="sidebarToggle" type="button" aria-label="打开会话列表">☰</button>
+            <div>
+              <div class="page-title" id="pageTitle">新会话</div>
+              <div class="page-meta" id="pageMeta">准备本地会话</div>
+            </div>
+          </div>
+          <div class="topbar-actions">
+            <div class="run-status idle" id="runStatus">
+              <span class="status-dot"></span>
+              <span id="runStatusText">就绪</span>
+            </div>
+            <button class="secondary-button" id="diffButton" type="button">查看改动</button>
+            <button class="secondary-button details-button" id="inspectorToggle" type="button">任务详情</button>
+          </div>
+        </header>
+
+        <section class="conversation" id="conversation" aria-live="polite">
+          <div class="empty-state" id="emptyState">
+            <div class="empty-symbol" aria-hidden="true">✦</div>
+            <h1>准备好一起完成什么？</h1>
+            <p>描述目标即可。Rivet 会先理解项目，再规划、修改并验证结果。</p>
+          </div>
+          <div class="message-list" id="messageList"></div>
+        </section>
+
+        <footer class="composer-wrap">
+          <form class="composer" id="composerForm">
+            <label class="sr-only" for="messageInput">输入任务</label>
+            <textarea id="messageInput" rows="1" maxlength="100000" placeholder="描述你希望 Rivet 完成的任务…"></textarea>
+            <div class="composer-footer">
+              <div class="composer-hint"><kbd>Enter</kbd> 发送 · <kbd>Shift</kbd> + <kbd>Enter</kbd> 换行</div>
+              <button class="send-button" id="sendButton" type="submit" aria-label="发送消息">
+                <svg class="send-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path d="m7 11 5-5 5 5" />
+                  <path d="M12 18V6" />
+                </svg>
+              </button>
+            </div>
+          </form>
+          <p class="local-note">Rivet 在本机运行。提交前请检查 Agent 产生的代码修改。</p>
+        </footer>
+      </main>
+
+      <aside class="inspector" id="inspector" aria-label="任务详情">
+        <div class="inspector-header">
+          <div>
+            <div class="inspector-title">任务详情</div>
+            <div class="inspector-subtitle" id="turnSummary">尚未开始</div>
+          </div>
+          <button class="icon-button inspector-close" id="inspectorClose" type="button" aria-label="关闭任务详情">×</button>
+        </div>
+
+        <div class="tab-list" role="tablist" aria-label="任务信息">
+          <button class="tab active" type="button" data-tab="plan" role="tab" aria-selected="true">计划</button>
+          <button class="tab" type="button" data-tab="changes" role="tab" aria-selected="false">改动</button>
+          <button class="tab" type="button" data-tab="activity" role="tab" aria-selected="false">活动</button>
+        </div>
+
+        <div class="inspector-body">
+          <section class="tab-panel active" id="planPanel" data-panel="plan" role="tabpanel">
+            <div class="panel-empty" id="planEmpty">
+              <div class="panel-empty-icon">◇</div>
+              <strong>暂无任务计划</strong>
+              <span>复杂任务开始后，步骤会显示在这里。</span>
+            </div>
+            <ol class="plan-list" id="planList"></ol>
+          </section>
+
+          <section class="tab-panel" id="changesPanel" data-panel="changes" role="tabpanel">
+            <div class="metric-grid">
+              <div class="metric-card"><span>已检查</span><strong id="inspectedCount">0</strong></div>
+              <div class="metric-card"><span>已修改</span><strong id="changedCount">0</strong></div>
+            </div>
+            <div class="verification-card neutral" id="verificationCard">
+              <span class="verification-icon">·</span>
+              <div><strong id="verificationTitle">无需验证</strong><span id="verificationDetail">还没有文件修改</span></div>
+            </div>
+            <div class="file-list" id="changedFiles"></div>
+          </section>
+
+          <section class="tab-panel" id="activityPanel" data-panel="activity" role="tabpanel">
+            <div class="activity-list" id="activityList">
+              <div class="panel-empty compact">
+                <strong>等待任务</strong>
+                <span>模型步骤和工具动作会实时显示。</span>
+              </div>
+            </div>
+          </section>
+        </div>
+      </aside>
+    </div>
+
+    <div class="mobile-backdrop" id="mobileBackdrop"></div>
+
+    <div class="modal-backdrop" id="approvalModal" hidden>
+      <section class="modal approval-modal" role="dialog" aria-modal="true" aria-labelledby="approvalTitle">
+        <div class="modal-icon warning" aria-hidden="true">!</div>
+        <div class="modal-copy">
+          <span class="eyebrow">需要你的确认</span>
+          <h2 id="approvalTitle">允许执行此操作？</h2>
+          <p id="approvalTool">工具操作</p>
+          <pre id="approvalSummary"></pre>
+        </div>
+        <div class="modal-actions">
+          <button class="secondary-button" id="rejectApprovalButton" type="button">拒绝</button>
+          <button class="danger-button" id="approveButton" type="button">允许一次</button>
+        </div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop" id="diffModal" hidden>
+      <section class="modal diff-modal" role="dialog" aria-modal="true" aria-labelledby="diffTitle">
+        <div class="diff-modal-header">
+          <div><span class="eyebrow">SESSION DIFF</span><h2 id="diffTitle">本次会话改动</h2></div>
+          <button class="icon-button" id="closeDiffButton" type="button" aria-label="关闭改动窗口">×</button>
+        </div>
+        <pre class="diff-content" id="diffContent">正在读取…</pre>
+      </section>
+    </div>
+
+    <div class="toast-region" id="toastRegion" aria-live="assertive"></div>
+  </body>
+</html>

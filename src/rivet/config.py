@@ -20,16 +20,33 @@ RESERVED_HEADER_FIELDS = {"content-type", "accept", "user-agent"}
 RESERVED_MESSAGE_FIELDS = {"role", "content", "tool_calls"}
 
 
+def _default_env_candidates() -> list[Path]:
+    candidates = [Path.home() / ".rivet" / ".env"]
+    source_root = Path(__file__).resolve().parents[2]
+    if (source_root / "pyproject.toml").is_file() and (
+        source_root / ".env.example"
+    ).is_file():
+        candidates.append(source_root / ".env")
+    candidates.append(Path.cwd() / ".env")
+    return candidates
+
+
 def _load_env_file(reference: str | Path | None) -> tuple[dict[str, str], Path | None]:
-    explicit = reference is not None
-    path = (
-        Path(reference).expanduser()
-        if reference is not None
-        else Path.cwd() / ".env"
-    ).resolve(strict=False)
-    if not path.exists():
+    selected = reference
+    if selected is None:
+        configured = os.environ.get("RIVET_ENV_FILE")
+        selected = configured.strip() if configured and configured.strip() else None
+
+    explicit = selected is not None
+    if explicit:
+        paths = [Path(selected).expanduser().resolve(strict=False)]
+    else:
+        paths = [candidate.resolve(strict=False) for candidate in _default_env_candidates()]
+
+    path = next((candidate for candidate in paths if candidate.exists()), None)
+    if path is None:
         if explicit:
-            raise ConfigurationError(f"environment file does not exist: {path}")
+            raise ConfigurationError(f"environment file does not exist: {paths[0]}")
         return {}, None
     if not path.is_file():
         raise ConfigurationError(f"environment file is not a regular file: {path}")

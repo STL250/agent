@@ -7,11 +7,12 @@ planning, sessions, or the TUI.
 
 ## Configuration sources
 
-At startup Rivet reads `.env` from the launch directory, or the file selected by
-`--env-file`. Values are resolved in this order:
+At startup Rivet discovers configuration in this order: `--env-file`,
+`RIVET_ENV_FILE`, `~/.rivet/.env`, `.env` in an editable Rivet source checkout,
+then `.env` in the launch directory. Values are resolved in this order:
 
 ```text
-command line > process environment > env file > defaults
+command line > process environment > discovered env file > defaults
 ```
 
 The parser is built in and does not export file values into the process environment. It
