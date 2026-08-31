@@ -42,18 +42,29 @@ const ui = {
   approvalSummary: $("#approvalSummary"),
   approve: $("#approveButton"),
   reject: $("#rejectApprovalButton"),
+  stopApprovalTask: $("#stopApprovalTaskButton"),
   diffModal: $("#diffModal"),
   diffContent: $("#diffContent"),
+  diffFileCount: $("#diffFileCount"),
+  diffFileList: $("#diffFileList"),
+  diffActivePath: $("#diffActivePath"),
+  diffSummary: $("#diffSummary"),
   toasts: $("#toastRegion"),
 };
 
 let currentSnapshot = null;
 let busy = false;
+let cancelling = false;
 let activeAssistant = null;
 let lastAssistantText = "";
 let pendingApproval = null;
 let activityStarted = false;
+let thinkingIndicator = null;
 const runningTools = [];
+let currentDiffFiles = [];
+let activeDiffIndex = -1;
+let currentDiffTruncated = false;
+let followLatestMessage = true;
 
 async function request(path, options = {}) {
   const headers = new Headers(options.headers || {});
@@ -82,12 +93,16 @@ async function jsonRequest(path, options = {}) {
 
 function setBusy(value, label = "就绪") {
   busy = value;
-  ui.send.disabled = value;
+  if (!value) cancelling = false;
+  ui.send.disabled = value && cancelling;
+  ui.send.classList.toggle("stop", value);
+  ui.send.setAttribute("aria-label", value ? "停止当前任务" : "发送消息");
   ui.newSession.disabled = value;
   ui.input.disabled = value;
   ui.runStatus.className = `run-status ${value ? "working" : "idle"}`;
   ui.runStatusText.textContent = value ? label : "就绪";
   if (!value) {
+    clearThinking();
     ui.input.disabled = false;
     ui.input.focus();
   }
@@ -95,11 +110,15 @@ function setBusy(value, label = "就绪") {
 
 function setRunError(message) {
   busy = false;
+  cancelling = false;
   ui.send.disabled = false;
+  ui.send.classList.remove("stop");
+  ui.send.setAttribute("aria-label", "发送消息");
   ui.newSession.disabled = false;
   ui.input.disabled = false;
   ui.runStatus.className = "run-status error";
   ui.runStatusText.textContent = "已停止";
+  clearThinking();
   toast(message, "error");
 }
 
@@ -111,22 +130,252 @@ function toast(message, kind = "info") {
   window.setTimeout(() => item.remove(), 4400);
 }
 
-function scrollToBottom() {
+function conversationIsNearBottom() {
+  return ui.conversation.scrollHeight - ui.conversation.scrollTop - ui.conversation.clientHeight < 72;
+}
+
+function scrollToBottom({ force = false } = {}) {
+  if (!force && !followLatestMessage) return;
   ui.conversation.scrollTop = ui.conversation.scrollHeight;
+  followLatestMessage = true;
 }
 
 function showConversation() {
   ui.empty.classList.add("hidden");
 }
 
+function showThinking(step) {
+  showConversation();
+  if (thinkingIndicator) {
+    thinkingIndicator.querySelector("span:last-child").textContent = `第 ${step} 步`;
+    scrollToBottom();
+    return;
+  }
+  const row = document.createElement("div");
+  row.className = "thinking-indicator";
+  const spinner = document.createElement("span");
+  spinner.className = "thinking-spinner";
+  spinner.setAttribute("aria-hidden", "true");
+  const label = document.createElement("strong");
+  label.textContent = "Rivet 正在思考";
+  const meta = document.createElement("span");
+  meta.textContent = `第 ${step} 步`;
+  row.append(spinner, label, meta);
+  ui.messages.append(row);
+  thinkingIndicator = row;
+  scrollToBottom();
+}
+
+function clearThinking() {
+  if (!thinkingIndicator) return;
+  thinkingIndicator.remove();
+  thinkingIndicator = null;
+}
+
+function appendInlineMarkdown(parent, text) {
+  const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\[[^\]\n]+\]\(https?:\/\/[^\s)]+\))/g;
+  let cursor = 0;
+  for (const match of text.matchAll(pattern)) {
+    const index = match.index || 0;
+    if (index > cursor) parent.append(document.createTextNode(text.slice(cursor, index)));
+    const tokenText = match[0];
+    if (tokenText.startsWith("`")) {
+      const code = document.createElement("code");
+      code.className = "inline-code";
+      code.textContent = tokenText.slice(1, -1);
+      parent.append(code);
+    } else if (tokenText.startsWith("**")) {
+      const strong = document.createElement("strong");
+      strong.textContent = tokenText.slice(2, -2);
+      parent.append(strong);
+    } else {
+      const parts = /^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/.exec(tokenText);
+      if (parts) {
+        const link = document.createElement("a");
+        link.textContent = parts[1];
+        link.href = parts[2];
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        parent.append(link);
+      } else {
+        parent.append(document.createTextNode(tokenText));
+      }
+    }
+    cursor = index + tokenText.length;
+  }
+  if (cursor < text.length) parent.append(document.createTextNode(text.slice(cursor)));
+}
+
+function isMarkdownBlockStart(line) {
+  return /^(?:```|#{1,4}\s+|\s*[-*+]\s+|\s*\d+\.\s+|>\s?|---+$)/.test(line);
+}
+
+function makeCodeBlock(language, source) {
+  const block = document.createElement("section");
+  block.className = "code-block";
+  const header = document.createElement("div");
+  header.className = "code-block-header";
+  const label = document.createElement("span");
+  label.textContent = language || "code";
+  const actions = document.createElement("div");
+  actions.className = "code-block-actions";
+  const lineCount = source ? source.split("\n").length : 0;
+  if (lineCount > 20) {
+    block.classList.add("collapsible", "collapsed");
+    const expand = document.createElement("button");
+    expand.type = "button";
+    expand.className = "code-expand-button";
+    expand.textContent = `展开 ${lineCount} 行`;
+    expand.addEventListener("click", () => {
+      const collapsed = block.classList.toggle("collapsed");
+      expand.textContent = collapsed ? `展开 ${lineCount} 行` : "收起";
+    });
+    actions.append(expand);
+  }
+  const copy = document.createElement("button");
+  copy.type = "button";
+  copy.className = "code-copy-button";
+  copy.textContent = "复制";
+  copy.addEventListener("click", async () => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(source);
+      } else {
+        const fallback = document.createElement("textarea");
+        fallback.value = source;
+        fallback.style.position = "fixed";
+        fallback.style.opacity = "0";
+        document.body.append(fallback);
+        fallback.select();
+        document.execCommand("copy");
+        fallback.remove();
+      }
+      copy.textContent = "已复制";
+      window.setTimeout(() => { copy.textContent = "复制"; }, 1400);
+    } catch (_) {
+      toast("无法复制代码，请手动选择", "warning");
+    }
+  });
+  const pre = document.createElement("pre");
+  const code = document.createElement("code");
+  code.textContent = source;
+  pre.append(code);
+  actions.append(copy);
+  header.append(label, actions);
+  block.append(header, pre);
+  return block;
+}
+
+function renderMarkdown(target, source) {
+  const lines = String(source || "").replace(/\r\n?/g, "\n").split("\n");
+  const fragment = document.createDocumentFragment();
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+    const fence = /^```([^\s`]*)\s*$/.exec(line);
+    if (fence) {
+      index += 1;
+      const codeLines = [];
+      while (index < lines.length && !/^```\s*$/.test(lines[index])) {
+        codeLines.push(lines[index]);
+        index += 1;
+      }
+      if (index < lines.length) index += 1;
+      fragment.append(makeCodeBlock(fence[1], codeLines.join("\n")));
+      continue;
+    }
+    const heading = /^(#{1,4})\s+(.+)$/.exec(line);
+    if (heading) {
+      const title = document.createElement(`h${heading[1].length + 1}`);
+      appendInlineMarkdown(title, heading[2]);
+      fragment.append(title);
+      index += 1;
+      continue;
+    }
+    if (/^---+$/.test(line.trim())) {
+      fragment.append(document.createElement("hr"));
+      index += 1;
+      continue;
+    }
+    if (/^>\s?/.test(line)) {
+      const quote = document.createElement("blockquote");
+      while (index < lines.length && /^>\s?/.test(lines[index])) {
+        if (quote.childNodes.length) quote.append(document.createElement("br"));
+        appendInlineMarkdown(quote, lines[index].replace(/^>\s?/, ""));
+        index += 1;
+      }
+      fragment.append(quote);
+      continue;
+    }
+    const unordered = /^\s*[-*+]\s+/.test(line);
+    const ordered = /^\s*\d+\.\s+/.test(line);
+    if (unordered || ordered) {
+      const list = document.createElement(ordered ? "ol" : "ul");
+      const matcher = ordered ? /^\s*\d+\.\s+(.+)$/ : /^\s*[-*+]\s+(.+)$/;
+      while (index < lines.length) {
+        const itemMatch = matcher.exec(lines[index]);
+        if (!itemMatch) break;
+        const item = document.createElement("li");
+        appendInlineMarkdown(item, itemMatch[1]);
+        list.append(item);
+        index += 1;
+      }
+      fragment.append(list);
+      continue;
+    }
+
+    const paragraph = document.createElement("p");
+    let firstLine = true;
+    while (index < lines.length && lines[index].trim() && !isMarkdownBlockStart(lines[index])) {
+      if (!firstLine) paragraph.append(document.createElement("br"));
+      appendInlineMarkdown(paragraph, lines[index]);
+      firstLine = false;
+      index += 1;
+    }
+    if (firstLine) {
+      appendInlineMarkdown(paragraph, line);
+      index += 1;
+    }
+    fragment.append(paragraph);
+  }
+  target.replaceChildren(fragment);
+}
+
+function queueAssistantRender(message) {
+  if (message.frame) return;
+  message.frame = window.requestAnimationFrame(() => {
+    message.frame = null;
+    renderMarkdown(message.body, message.raw);
+    scrollToBottom();
+  });
+}
+
+function flushAssistantRender(message) {
+  if (message.frame) window.cancelAnimationFrame(message.frame);
+  message.frame = null;
+  renderMarkdown(message.body, message.raw);
+}
+
 function addMessage(role, text, { streaming = false } = {}) {
+  if (role === "assistant") clearThinking();
   showConversation();
   const article = document.createElement("article");
   article.className = `message ${role}${streaming ? " streaming" : ""}`;
 
   const avatar = document.createElement("div");
   avatar.className = "message-avatar";
-  avatar.textContent = role === "assistant" ? "R" : "你";
+  if (role === "assistant") {
+    avatar.innerHTML = `<svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <circle cx="12" cy="12" r="2.25"></circle>
+      <path d="M12 4.5v4M12 15.5v4M4.5 12h4M15.5 12h4M6.7 6.7 9.5 9.5m5 5 2.8 2.8M17.3 6.7l-2.8 2.8m-5 5-2.8 2.8"></path>
+    </svg>`;
+  } else {
+    avatar.textContent = "你";
+  }
 
   const content = document.createElement("div");
   content.className = "message-content";
@@ -135,12 +384,17 @@ function addMessage(role, text, { streaming = false } = {}) {
   label.textContent = role === "assistant" ? "Rivet" : "You";
   const body = document.createElement("div");
   body.className = "message-text";
-  body.textContent = text;
+  if (role === "assistant") {
+    body.classList.add("markdown-body");
+    renderMarkdown(body, text);
+  } else {
+    body.textContent = text;
+  }
   content.append(label, body);
   article.append(avatar, content);
   ui.messages.append(article);
   scrollToBottom();
-  return { article, body };
+  return { article, body, raw: text, frame: null };
 }
 
 function addSystemNote(text) {
@@ -178,6 +432,7 @@ function toolLabel(name) {
 }
 
 function addToolCard(data) {
+  clearThinking();
   showConversation();
   const card = document.createElement("div");
   card.className = "tool-card running";
@@ -265,6 +520,7 @@ function protocolLabel(protocol) {
 }
 
 function renderConversation(messages) {
+  clearThinking();
   ui.messages.replaceChildren();
   activeAssistant = null;
   lastAssistantText = "";
@@ -277,7 +533,7 @@ function renderConversation(messages) {
     addMessage(message.role === "assistant" ? "assistant" : "user", message.content || "");
     if (message.role === "assistant") lastAssistantText = message.content || "";
   }
-  scrollToBottom();
+  window.requestAnimationFrame(() => scrollToBottom({ force: true }));
 }
 
 function renderPlan(plan) {
@@ -409,22 +665,28 @@ function handleEvent(event, data) {
       break;
     case "model_start":
       setBusy(true, `第 ${data.step} 步`);
+      showThinking(data.step);
       addActivity("模型思考", `第 ${data.step} 步 · 第 ${data.turn} 轮`);
       break;
     case "assistant_stream_start":
+      clearThinking();
       activeAssistant = addMessage("assistant", "", { streaming: true });
       break;
     case "assistant_text_delta":
       if (!activeAssistant) activeAssistant = addMessage("assistant", "", { streaming: true });
-      activeAssistant.body.textContent += data.text || "";
-      lastAssistantText = activeAssistant.body.textContent;
-      scrollToBottom();
+      activeAssistant.raw += data.text || "";
+      lastAssistantText = activeAssistant.raw;
+      queueAssistantRender(activeAssistant);
       break;
     case "assistant_stream_end":
-      if (activeAssistant) activeAssistant.article.classList.remove("streaming");
+      if (activeAssistant) {
+        flushAssistantRender(activeAssistant);
+        activeAssistant.article.classList.remove("streaming");
+      }
       activeAssistant = null;
       break;
     case "assistant_text":
+      clearThinking();
       if (!data.streamed && data.text) {
         addMessage("assistant", data.text);
         lastAssistantText = data.text;
@@ -462,12 +724,17 @@ function handleEvent(event, data) {
       toast(data.message || "会话保存失败", "error");
       break;
     case "cancelled":
+      clearThinking();
+      pendingApproval = null;
+      ui.approvalModal.hidden = true;
       addSystemNote(`操作已取消：${data.phase || "当前步骤"}`);
       break;
     case "completed":
+      clearThinking();
       addActivity("任务完成", "结果已生成", "success");
       break;
     case "stopped":
+      clearThinking();
       addActivity("任务停止", data.reason || "未完成", "error");
       break;
     default:
@@ -502,6 +769,7 @@ function handleRecord(record) {
 async function sendTurn(message) {
   const task = message.trim();
   if (!task || busy) return;
+  followLatestMessage = true;
   addMessage("user", task);
   lastAssistantText = "";
   activeAssistant = null;
@@ -536,6 +804,33 @@ async function sendTurn(message) {
   }
 }
 
+async function cancelTurn() {
+  if (!busy || cancelling) return false;
+  cancelling = true;
+  ui.send.disabled = true;
+  ui.runStatusText.textContent = "正在停止";
+  try {
+    await jsonRequest("/api/cancel", {
+      method: "POST",
+      body: "{}",
+    });
+    toast("正在安全停止当前任务");
+    return true;
+  } catch (error) {
+    cancelling = false;
+    ui.send.disabled = false;
+    toast(error.message || "无法停止当前任务", "error");
+    return false;
+  }
+}
+
+async function stopTaskFromApproval() {
+  if (await cancelTurn()) {
+    pendingApproval = null;
+    ui.approvalModal.hidden = true;
+  }
+}
+
 async function newSession() {
   if (busy) return;
   try {
@@ -547,6 +842,7 @@ async function newSession() {
     ui.activity.replaceChildren();
     renderSnapshot(snapshot, { renderMessages: true });
     closeMobilePanels();
+    ui.input.focus();
     toast("已创建新的空白会话");
   } catch (error) {
     toast(error.message, "error");
@@ -564,6 +860,7 @@ async function resumeSession(id) {
     ui.activity.replaceChildren();
     renderSnapshot(snapshot, { renderMessages: true });
     closeMobilePanels();
+    ui.input.focus();
     const drifted = snapshot.resume && snapshot.resume.drifted ? snapshot.resume.drifted.length : 0;
     toast(drifted ? `会话已恢复；${drifted} 个文件在关闭期间发生变化` : "会话已恢复", drifted ? "warning" : "info");
   } catch (error) {
@@ -571,13 +868,185 @@ async function resumeSession(id) {
   }
 }
 
+function cleanDiffPath(header) {
+  const value = String(header || "").replace(/^(?:---|\+\+\+)\s+/, "").split("\t")[0].trim();
+  if (!value || value === "/dev/null") return "";
+  return value.replace(/^[ab]\//, "");
+}
+
+function parseUnifiedDiff(raw, declaredFiles = []) {
+  const lines = String(raw || "").replace(/\r\n?/g, "\n").split("\n");
+  const files = [];
+  let current = null;
+  let oldLine = null;
+  let newLine = null;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (line.startsWith("--- ") && index + 1 < lines.length && lines[index + 1].startsWith("+++ ")) {
+      const oldPath = cleanDiffPath(line);
+      const newPath = cleanDiffPath(lines[index + 1]);
+      current = {
+        path: newPath || oldPath || `文件 ${files.length + 1}`,
+        oldPath,
+        newPath,
+        additions: 0,
+        deletions: 0,
+        lines: [],
+      };
+      files.push(current);
+      oldLine = null;
+      newLine = null;
+      index += 1;
+      continue;
+    }
+    if (!current) continue;
+
+    const hunk = /^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@(.*)$/.exec(line);
+    if (hunk) {
+      oldLine = Number(hunk[1]);
+      newLine = Number(hunk[2]);
+      current.lines.push({ type: "hunk", content: line, old: null, new: null });
+      continue;
+    }
+    if (line.startsWith("+") && !line.startsWith("+++")) {
+      current.lines.push({ type: "add", content: line.slice(1), old: null, new: newLine });
+      current.additions += 1;
+      if (newLine !== null) newLine += 1;
+      continue;
+    }
+    if (line.startsWith("-") && !line.startsWith("---")) {
+      current.lines.push({ type: "delete", content: line.slice(1), old: oldLine, new: null });
+      current.deletions += 1;
+      if (oldLine !== null) oldLine += 1;
+      continue;
+    }
+    if (line.startsWith(" ")) {
+      current.lines.push({ type: "context", content: line.slice(1), old: oldLine, new: newLine });
+      if (oldLine !== null) oldLine += 1;
+      if (newLine !== null) newLine += 1;
+      continue;
+    }
+    if (line) current.lines.push({ type: "meta", content: line, old: null, new: null });
+  }
+
+  for (const path of declaredFiles) {
+    if (files.some((file) => file.path === path)) continue;
+    files.push({
+      path,
+      oldPath: path,
+      newPath: path,
+      additions: 0,
+      deletions: 0,
+      lines: [{ type: "meta", content: "该文件的文本 Diff 当前不可用。", old: null, new: null }],
+    });
+  }
+  return files;
+}
+
+function renderDiffFile(index) {
+  const file = currentDiffFiles[index];
+  if (!file) return;
+  activeDiffIndex = index;
+  $$(".diff-file-item").forEach((item, itemIndex) => {
+    item.classList.toggle("active", itemIndex === index);
+  });
+  ui.diffActivePath.textContent = file.path;
+  ui.diffActivePath.title = file.path;
+  ui.diffSummary.replaceChildren();
+  const additions = document.createElement("span");
+  additions.className = "diff-additions";
+  additions.textContent = `+${file.additions}`;
+  const deletions = document.createElement("span");
+  deletions.className = "diff-deletions";
+  deletions.textContent = `−${file.deletions}`;
+  ui.diffSummary.append(additions, deletions);
+  if (currentDiffTruncated) {
+    const truncated = document.createElement("span");
+    truncated.className = "diff-truncated";
+    truncated.textContent = "内容已截断";
+    ui.diffSummary.append(truncated);
+  }
+
+  const fragment = document.createDocumentFragment();
+  for (const line of file.lines) {
+    const row = document.createElement("div");
+    row.className = `diff-line ${line.type}`;
+    if (line.type === "hunk" || line.type === "meta") {
+      const meta = document.createElement("code");
+      meta.className = "diff-line-meta";
+      meta.textContent = line.content;
+      row.append(meta);
+    } else {
+      const oldNumber = document.createElement("span");
+      oldNumber.className = "diff-line-number";
+      oldNumber.textContent = line.old === null ? "" : String(line.old);
+      const newNumber = document.createElement("span");
+      newNumber.className = "diff-line-number";
+      newNumber.textContent = line.new === null ? "" : String(line.new);
+      const prefix = document.createElement("span");
+      prefix.className = "diff-line-prefix";
+      prefix.textContent = line.type === "add" ? "+" : line.type === "delete" ? "−" : " ";
+      const code = document.createElement("code");
+      code.textContent = line.content || " ";
+      row.append(oldNumber, newNumber, prefix, code);
+    }
+    fragment.append(row);
+  }
+  if (!file.lines.length) {
+    const empty = document.createElement("div");
+    empty.className = "diff-empty";
+    empty.textContent = "这个文件没有可显示的文本差异。";
+    fragment.append(empty);
+  }
+  ui.diffContent.replaceChildren(fragment);
+  ui.diffContent.scrollTop = 0;
+  ui.diffContent.scrollLeft = 0;
+}
+
+function renderDiff(diff) {
+  currentDiffTruncated = Boolean(diff && diff.truncated);
+  currentDiffFiles = parseUnifiedDiff(diff && diff.diff, Array.isArray(diff && diff.files) ? diff.files : []);
+  activeDiffIndex = -1;
+  ui.diffFileList.replaceChildren();
+  ui.diffFileCount.textContent = String(currentDiffFiles.length);
+  if (!currentDiffFiles.length) {
+    ui.diffActivePath.textContent = "本次会话尚无文件改动";
+    ui.diffSummary.replaceChildren();
+    const empty = document.createElement("div");
+    empty.className = "diff-empty";
+    empty.textContent = "Rivet 修改文件后，差异会按文件显示在这里。";
+    ui.diffContent.replaceChildren(empty);
+    return;
+  }
+
+  currentDiffFiles.forEach((file, index) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "diff-file-item";
+    button.title = file.path;
+    const path = document.createElement("span");
+    path.textContent = file.path;
+    const stats = document.createElement("small");
+    stats.textContent = `+${file.additions}  −${file.deletions}`;
+    button.append(path, stats);
+    button.addEventListener("click", () => renderDiffFile(index));
+    ui.diffFileList.append(button);
+  });
+  renderDiffFile(0);
+}
+
 async function showDiff() {
   ui.diffModal.hidden = false;
+  ui.diffFileList.replaceChildren();
+  ui.diffFileCount.textContent = "0";
+  ui.diffActivePath.textContent = "正在读取改动…";
+  ui.diffSummary.replaceChildren();
   ui.diffContent.textContent = "正在读取…";
   try {
-    const diff = await jsonRequest("/api/diff");
-    ui.diffContent.textContent = diff.diff || "本次会话尚无文件改动。";
+    renderDiff(await jsonRequest("/api/diff"));
   } catch (error) {
+    ui.diffActivePath.textContent = "无法读取改动";
     ui.diffContent.textContent = error.message;
   }
 }
@@ -611,6 +1080,10 @@ async function bootstrap() {
 
 ui.form.addEventListener("submit", (event) => {
   event.preventDefault();
+  if (busy) {
+    cancelTurn();
+    return;
+  }
   sendTurn(ui.input.value);
 });
 
@@ -621,6 +1094,9 @@ ui.input.addEventListener("keydown", (event) => {
   }
 });
 ui.input.addEventListener("input", resizeComposer);
+ui.conversation.addEventListener("scroll", () => {
+  followLatestMessage = conversationIsNearBottom();
+}, { passive: true });
 ui.newSession.addEventListener("click", newSession);
 $("#refreshSessionsButton").addEventListener("click", bootstrap);
 $("#diffButton").addEventListener("click", showDiff);
@@ -630,6 +1106,7 @@ ui.diffModal.addEventListener("click", (event) => {
 });
 ui.approve.addEventListener("click", () => answerApproval(true));
 ui.reject.addEventListener("click", () => answerApproval(false));
+ui.stopApprovalTask.addEventListener("click", stopTaskFromApproval);
 $("#sidebarToggle").addEventListener("click", () => openMobilePanel(ui.sidebar));
 $("#inspectorToggle").addEventListener("click", () => openMobilePanel(ui.inspector));
 $("#inspectorClose").addEventListener("click", closeMobilePanels);

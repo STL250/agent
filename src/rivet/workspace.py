@@ -8,6 +8,8 @@ import signal
 import stat
 import subprocess
 import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -108,9 +110,16 @@ VERIFICATION_COMMANDS = (
 class Workspace:
     """All filesystem operations are resolved against one trusted root."""
 
-    def __init__(self, root: Path, *, max_output_chars: int = 20_000) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        max_output_chars: int = 20_000,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
         self.root = root.resolve()
         self.max_output_chars = max_output_chars
+        self.cancel_event = cancel_event
         self._original_text: dict[Path, str | None] = {}
         self._unavailable_diffs: dict[Path, str] = {}
 
@@ -458,29 +467,39 @@ class Workspace:
             creationflags=creation_flags,
             start_new_session=os.name != "nt",
         )
-        try:
-            stdout, stderr = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            self._terminate_process_tree(process)
-            stdout, stderr = process.communicate()
+        windows_job = self._create_windows_job(process)
+        deadline = time.monotonic() + timeout
+        cancelled = False
+        timed_out = False
+        while True:
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                cancelled = True
+                self._terminate_process_tree(process, windows_job)
+                stdout, stderr = process.communicate()
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                self._terminate_process_tree(process, windows_job)
+                stdout, stderr = process.communicate()
+                break
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.2, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+            except KeyboardInterrupt:
+                cancelled = True
+                self._terminate_process_tree(process, windows_job)
+                stdout, stderr = process.communicate()
+                break
+
+        if timed_out or cancelled:
             command_result: dict[str, Any] = {
                 "command": command,
                 "exit_code": None,
-                "timed_out": True,
-                "cancelled": False,
-                "verification": verification,
-                "purpose": purpose,
-                "stdout": self._truncate(self._output_text(stdout)),
-                "stderr": self._truncate(self._output_text(stderr)),
-            }
-        except KeyboardInterrupt:
-            self._terminate_process_tree(process)
-            stdout, stderr = process.communicate()
-            command_result = {
-                "command": command,
-                "exit_code": None,
-                "timed_out": False,
-                "cancelled": True,
+                "timed_out": timed_out,
+                "cancelled": cancelled,
                 "verification": verification,
                 "purpose": purpose,
                 "stdout": self._truncate(self._output_text(stdout)),
@@ -497,6 +516,7 @@ class Workspace:
                 "stdout": self._truncate(stdout),
                 "stderr": self._truncate(stderr),
             }
+        self._close_windows_job(windows_job)
 
         try:
             after = self._capture_snapshot(capture_text=False)
@@ -516,10 +536,119 @@ class Workspace:
         return command_result
 
     @staticmethod
-    def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    def _create_windows_job(process: subprocess.Popen[str]) -> int | None:
+        if os.name != "nt":
+            return None
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class BasicLimitInformation(ctypes.Structure):
+                _fields_ = [
+                    ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                    ("PerJobUserTimeLimit", ctypes.c_longlong),
+                    ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD),
+                ]
+
+            class IoCounters(ctypes.Structure):
+                _fields_ = [
+                    ("ReadOperationCount", ctypes.c_ulonglong),
+                    ("WriteOperationCount", ctypes.c_ulonglong),
+                    ("OtherOperationCount", ctypes.c_ulonglong),
+                    ("ReadTransferCount", ctypes.c_ulonglong),
+                    ("WriteTransferCount", ctypes.c_ulonglong),
+                    ("OtherTransferCount", ctypes.c_ulonglong),
+                ]
+
+            class ExtendedLimitInformation(ctypes.Structure):
+                _fields_ = [
+                    ("BasicLimitInformation", BasicLimitInformation),
+                    ("IoInfo", IoCounters),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t),
+                ]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+            kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+            kernel32.SetInformationJobObject.argtypes = [
+                wintypes.HANDLE,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                wintypes.DWORD,
+            ]
+            kernel32.SetInformationJobObject.restype = wintypes.BOOL
+            kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+            kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            job = kernel32.CreateJobObjectW(None, None)
+            if not job:
+                return None
+            information = ExtendedLimitInformation()
+            information.BasicLimitInformation.LimitFlags = 0x00002000
+            configured = kernel32.SetInformationJobObject(
+                job,
+                9,
+                ctypes.byref(information),
+                ctypes.sizeof(information),
+            )
+            assigned = configured and kernel32.AssignProcessToJobObject(
+                job, wintypes.HANDLE(int(process._handle))
+            )
+            if not assigned:
+                kernel32.CloseHandle(job)
+                return None
+            return int(job)
+        except (AttributeError, OSError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _close_windows_job(job: int | None) -> None:
+        if os.name != "nt" or job is None:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle(wintypes.HANDLE(job))
+        except (AttributeError, OSError, TypeError, ValueError):
+            pass
+
+    @staticmethod
+    def _terminate_process_tree(
+        process: subprocess.Popen[str], windows_job: int | None = None
+    ) -> None:
         """Best-effort termination of the shell and descendants on Windows and POSIX."""
         if os.name == "nt":
+            if windows_job is not None:
+                try:
+                    import ctypes
+                    from ctypes import wintypes
+
+                    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                    kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+                    kernel32.TerminateJobObject.restype = wintypes.BOOL
+                    kernel32.TerminateJobObject(wintypes.HANDLE(windows_job), 1)
+                except (AttributeError, OSError, TypeError, ValueError):
+                    pass
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            try:
+                process.send_signal(signal.CTRL_BREAK_EVENT)
+                process.wait(timeout=0.75)
+            except (OSError, subprocess.SubprocessError, AttributeError):
+                pass
             try:
                 subprocess.run(
                     ["taskkill", "/PID", str(process.pid), "/T", "/F"],

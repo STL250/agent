@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
+import threading
+import unicodedata
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Callable, TextIO
 
 from . import __version__
 from .agent import AgentResult
@@ -36,6 +39,17 @@ class Console:
     GREEN = "\x1b[32m"
     YELLOW = "\x1b[33m"
     CYAN = "\x1b[36m"
+
+    COMMANDS = (
+        ("/help", "/help", "show all commands"),
+        ("/status", "/status", "show conversation and verification state"),
+        ("/plan", "/plan", "show the current task plan"),
+        ("/diff", "/diff [path]", "show changes from this conversation"),
+        ("/sessions", "/sessions", "list recent saved conversations"),
+        ("/resume", "/resume [id]", "resume the latest or selected conversation"),
+        ("/new", "/new", "start a fresh conversation"),
+        ("/exit", "/exit", "save and quit Rivet"),
+    )
 
     TOOL_LABELS = {
         "update_plan": "Plan",
@@ -77,6 +91,8 @@ class Console:
         "current": "*",
         "blocked": "!",
     }
+    UNICODE_SPINNER = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+    ASCII_SPINNER = ("-", "\\", "|", "/")
 
     def __init__(
         self,
@@ -92,6 +108,11 @@ class Console:
         self._stream_active = False
         self._stream_parts: list[str] = []
         self._last_stream_text = ""
+        self._activity_stop = threading.Event()
+        self._activity_thread: threading.Thread | None = None
+        self._activity_visible = False
+        self._activity_lock = threading.Lock()
+        self._activity_descriptor: tuple[str, str, str] | None = None
         if stream is None and color is not False and os.name == "nt":
             self._enable_windows_vt()
 
@@ -124,29 +145,44 @@ class Console:
 
     def banner(self, config: Config) -> None:
         print(
-            self.style(f"{self.glyph('top')} Rivet {__version__}", self.BOLD, self.CYAN),
+            f"{self.style(self.glyph('top'), self.CYAN)} "
+            f"{self.style('Rivet', self.BOLD)} {self.style(__version__, self.DIM)}",
             file=self.output,
         )
-        print(f"{self.glyph('side')}  model      {config.model}", file=self.output)
-        print(f"{self.glyph('side')}  protocol   {config.protocol}", file=self.output)
-        print(f"{self.glyph('side')}  workspace  {config.workspace}", file=self.output)
-        print(f"{self.glyph('side')}  approval   {config.approval_mode}", file=self.output)
+        self._banner_row("workspace", str(config.workspace))
+        self._banner_row("model", config.model)
+        self._banner_row("protocol", config.protocol)
+        self._banner_row("approval", config.approval_mode)
         print(
-            f"{self.glyph('bottom')} /help for commands | Ctrl+C cancels | /exit quits",
+            f"{self.style(self.glyph('bottom'), self.CYAN)} "
+            f"{self.style('Type / for commands · Ctrl+C cancels · /exit quits', self.DIM)}",
             file=self.output,
         )
+
+    def _banner_row(self, label: str, value: str) -> None:
+        key = self.style(f"{label:<10}", self.DIM)
+        print(f"{self.style(self.glyph('side'), self.CYAN)}  {key} {value}", file=self.output)
 
     def prompt(self) -> str:
         return self.style("\n" + self.glyph("prompt"), self.BOLD, self.GREEN)
 
+    def read_input(self, input_fn: Callable[[str], str] = input) -> str:
+        """Read one line, adding a live slash-command menu on interactive terminals."""
+        if input_fn is not input or not self._live_input_supported():
+            return input_fn(self.prompt())
+        try:
+            return self._read_live_input()
+        except (ImportError, OSError, ValueError):
+            return input_fn(self.prompt())
+
     def event(self, event: str, data: dict[str, Any]) -> None:
+        if event != "model_start":
+            self._stop_activity()
         if event == "model_start":
             self._last_stream_text = ""
             turn = data.get("turn", 1)
             step = data["step"]
-            label = self.style(f"{self.glyph('working')} Working", self.YELLOW)
-            meta = self.style(f"turn {turn} | step {step}", self.DIM)
-            print(f"\n{label}  {meta}", file=self.output)
+            self._start_activity("Working", f"turn {turn} · step {step}", leading_newline=True)
         elif event == "context_compacted":
             detail = f"context compacted to {data['messages']} messages"
             print(self.style(f"  └ {detail}", self.DIM), file=self.output)
@@ -171,6 +207,7 @@ class Console:
             detail = self._tool_arguments(data["name"], data["arguments"])
             prefix = self.style(self.glyph("arrow"), self.CYAN)
             print(f"  {prefix} {label}" + (f"  {detail}" if detail else ""), file=self.output)
+            self._start_activity("Running", label, indent="    ")
         elif event == "tool_end":
             self._tool_result(data["name"], data["result"])
         elif event == "plan_updated":
@@ -191,6 +228,7 @@ class Console:
             print(f"\n{marker} Cancelled  {phase}", file=self.output)
 
     def turn_result(self, result: AgentResult, turn: int) -> None:
+        self._stop_activity()
         if result.success:
             marker = self.style(self.glyph("success"), self.GREEN, self.BOLD)
             label = self.style("Completed", self.GREEN, self.BOLD)
@@ -238,22 +276,13 @@ class Console:
 
     def help(self) -> None:
         print(self.style("\nCommands", self.BOLD), file=self.output)
-        rows = (
-            ("/help", "show this help"),
-            ("/status", "show conversation and verification state"),
-            ("/plan", "show the current task plan and progress"),
-            ("/diff [path]", "show changes made in this conversation"),
-            ("/sessions", "list recent saved conversations"),
-            ("/resume [id]", "resume the latest or selected conversation"),
-            ("/new", "start a fresh conversation"),
-            ("/exit", "quit Rivet"),
-        )
-        for command, description in rows:
-            padding = " " * max(1, 18 - len(command))
+        for _, usage, description in self.COMMANDS:
+            padding = " " * max(1, 18 - len(usage))
             print(
-                f"  {self.style(command, self.CYAN)}{padding}{description}",
+                f"  {self.style(usage, self.CYAN)}{padding}{description}",
                 file=self.output,
             )
+        print(self.style("\n  Tip: type / to open the command menu.", self.DIM), file=self.output)
 
     def status(self, status: JsonObject) -> None:
         changed = ", ".join(status["changed_files"]) or "none"
@@ -320,29 +349,342 @@ class Console:
             print(self.style("  output truncated", self.YELLOW), file=self.output)
 
     def notice(self, text: str) -> None:
+        self._stop_activity()
         print(
             f"\n{self.style(self.glyph('notice'), self.CYAN)} {text}",
             file=self.output,
         )
 
     def warning(self, text: str) -> None:
+        self._stop_activity()
         print(f"\n{self.style('!', self.YELLOW, self.BOLD)} {text}", file=self.output)
 
     def error(self, text: str) -> None:
+        self._stop_activity()
         marker = self.style(self.glyph("failure"), self.RED, self.BOLD)
         print(f"{marker} {text}", file=self.errors)
 
     def goodbye(self) -> None:
+        self._stop_activity()
         print(self.style("\nSession ended.", self.DIM), file=self.output)
 
     def input_cancelled(self) -> None:
         self.notice("Input cleared. Type /exit to quit.")
 
     def approve(self, tool: str, summary: str) -> bool:
+        descriptor = self._activity_descriptor
+        self._stop_activity()
         short = self._truncate(summary.replace("\n", " "), 180)
         prompt = self.style(f"\n? Approve {tool}  {short}? [y/N] ", self.YELLOW, self.BOLD)
         answer = input(prompt).strip().lower()
-        return answer in {"y", "yes"}
+        approved = answer in {"y", "yes"}
+        if approved and descriptor is not None:
+            label, meta, indent = descriptor
+            self._start_activity(label, meta, indent=indent)
+        return approved
+
+    def _read_live_input(self) -> str:
+        if os.name == "nt":
+            import msvcrt
+
+            return self._edit_line(lambda: self._windows_key(msvcrt))
+
+        import termios
+        import tty
+
+        descriptor = sys.stdin.fileno()
+        previous = termios.tcgetattr(descriptor)
+        try:
+            tty.setraw(descriptor)
+            return self._edit_line(self._posix_key)
+        finally:
+            termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
+
+    def _edit_line(self, read_key: Callable[[], str]) -> str:
+        text = ""
+        cursor = 0
+        selected = 0
+        menu_dismissed = False
+        previous_menu_lines = 0
+        previous_menu_lines = self._render_editor(
+            text, cursor, [], selected, previous_menu_lines, first=True
+        )
+
+        while True:
+            key = read_key()
+            matches = [] if menu_dismissed else self._command_matches(text)
+            if key == "ENTER":
+                if matches:
+                    text = matches[min(selected, len(matches) - 1)][0]
+                self._finish_editor(text, previous_menu_lines)
+                return text
+            if key == "CTRL_C":
+                self._finish_editor(text + "^C", previous_menu_lines)
+                raise KeyboardInterrupt
+            if key == "CTRL_D":
+                if not text:
+                    self._finish_editor("", previous_menu_lines)
+                    raise EOFError
+                if cursor < len(text):
+                    text = text[:cursor] + text[cursor + 1 :]
+                    menu_dismissed = False
+            elif key == "BACKSPACE":
+                if cursor:
+                    text = text[: cursor - 1] + text[cursor:]
+                    cursor -= 1
+                    selected = 0
+                    menu_dismissed = False
+            elif key == "DELETE":
+                if cursor < len(text):
+                    text = text[:cursor] + text[cursor + 1 :]
+                    selected = 0
+                    menu_dismissed = False
+            elif key == "LEFT":
+                cursor = max(0, cursor - 1)
+            elif key == "RIGHT":
+                cursor = min(len(text), cursor + 1)
+            elif key == "HOME" or key == "CTRL_A":
+                cursor = 0
+            elif key == "END" or key == "CTRL_E":
+                cursor = len(text)
+            elif key == "CTRL_U":
+                text = text[cursor:]
+                cursor = 0
+                selected = 0
+                menu_dismissed = False
+            elif key == "ESCAPE":
+                menu_dismissed = True
+            elif key in {"UP", "DOWN"} and matches:
+                offset = -1 if key == "UP" else 1
+                selected = (selected + offset) % len(matches)
+            elif key == "TAB" and matches:
+                command, usage, _ = matches[min(selected, len(matches) - 1)]
+                text = command + (" " if usage != command else "")
+                cursor = len(text)
+                selected = 0
+                menu_dismissed = True
+            elif len(key) == 1 and key.isprintable():
+                text = text[:cursor] + key + text[cursor:]
+                cursor += 1
+                selected = 0
+                menu_dismissed = False
+
+            matches = [] if menu_dismissed else self._command_matches(text)
+            if selected >= len(matches):
+                selected = 0
+            previous_menu_lines = self._render_editor(
+                text,
+                cursor,
+                matches,
+                selected,
+                previous_menu_lines,
+                menu_visible=not menu_dismissed,
+            )
+
+    def _render_editor(
+        self,
+        text: str,
+        cursor: int,
+        matches: list[tuple[str, str, str]],
+        selected: int,
+        previous_menu_lines: int,
+        *,
+        first: bool = False,
+        menu_visible: bool = True,
+    ) -> int:
+        output = self.output
+        if first:
+            output.write("\r\n")
+        else:
+            self._erase_editor_block(previous_menu_lines)
+
+        menu = (
+            self._command_menu(matches, selected)
+            if menu_visible
+            and text.startswith("/")
+            and not any(character.isspace() for character in text)
+            else []
+        )
+        prompt = self.style(self.glyph("prompt"), self.BOLD, self.GREEN)
+        output.write("\r" + prompt + text)
+        for line in menu:
+            output.write("\r\n" + line)
+        if menu:
+            output.write(f"\x1b[{len(menu)}A")
+        output.write("\r")
+        column = self._display_width(self.glyph("prompt")) + self._display_width(text[:cursor])
+        if column:
+            output.write(f"\x1b[{column}C")
+        output.flush()
+        return len(menu)
+
+    def _finish_editor(self, text: str, previous_menu_lines: int) -> None:
+        self._erase_editor_block(previous_menu_lines)
+        prompt = self.style(self.glyph("prompt"), self.BOLD, self.GREEN)
+        self.output.write("\r" + prompt + text + "\r\n")
+        self.output.flush()
+
+    def _erase_editor_block(self, menu_lines: int) -> None:
+        output = self.output
+        output.write("\r\x1b[2K")
+        for _ in range(menu_lines):
+            output.write("\x1b[1B\r\x1b[2K")
+        if menu_lines:
+            output.write(f"\x1b[{menu_lines}A")
+
+    def _command_menu(
+        self, matches: list[tuple[str, str, str]], selected: int
+    ) -> list[str]:
+        if not matches:
+            return [
+                self.style("  No matching commands", self.DIM),
+                self.style("  Esc close", self.DIM),
+            ]
+
+        terminal_lines = shutil.get_terminal_size((100, 24)).lines
+        visible_count = min(len(matches), max(2, min(terminal_lines - 7, 8)))
+        start = min(max(0, selected - visible_count + 1), len(matches) - visible_count)
+        visible = matches[start : start + visible_count]
+        lines = [self.style("  Slash commands", self.BOLD)]
+        for offset, (_, usage, description) in enumerate(visible):
+            index = start + offset
+            marker = self.style(self.glyph("prompt").strip(), self.CYAN) if index == selected else " "
+            command = self.style(usage, self.CYAN, self.BOLD) if index == selected else usage
+            padding = " " * max(2, 18 - len(usage))
+            detail = self.style(description, self.DIM)
+            lines.append(f"  {marker} {command}{padding}{detail}")
+        if len(visible) < len(matches):
+            lines.append(self.style(f"    {start + 1}-{start + len(visible)} of {len(matches)}", self.DIM))
+        lines.append(self.style("  ↑↓ select · Tab complete · Enter run · Esc close", self.DIM))
+        return lines
+
+    def _command_matches(self, text: str) -> list[tuple[str, str, str]]:
+        if not text.startswith("/") or any(character.isspace() for character in text):
+            return []
+        query = text.lower()
+        return [command for command in self.COMMANDS if command[0].startswith(query)]
+
+    def _start_activity(
+        self,
+        label: str,
+        meta: str = "",
+        *,
+        indent: str = "",
+        leading_newline: bool = False,
+    ) -> None:
+        self._stop_activity()
+        self._activity_descriptor = (label, meta, indent)
+        if not self._live_output_supported():
+            if label == "Working":
+                marker = self.style(self.glyph("working"), self.YELLOW)
+                detail = self.style(meta, self.DIM)
+                print(f"\n{marker} {label}" + (f"  {detail}" if detail else ""), file=self.output)
+            return
+
+        if leading_newline:
+            self.output.write("\n")
+        self._activity_stop.clear()
+        self._activity_visible = True
+        frames = self.UNICODE_SPINNER if self._unicode else self.ASCII_SPINNER
+
+        def animate() -> None:
+            index = 0
+            while not self._activity_stop.is_set():
+                marker = self.style(frames[index % len(frames)], self.CYAN, self.BOLD)
+                title = self.style(label, self.BOLD)
+                detail = self.style(meta, self.DIM)
+                line = f"{indent}{marker} {title}" + (f"  {detail}" if detail else "")
+                with self._activity_lock:
+                    self.output.write("\r\x1b[2K" + line)
+                    self.output.flush()
+                index += 1
+                self._activity_stop.wait(0.08)
+
+        self._activity_thread = threading.Thread(target=animate, daemon=True)
+        self._activity_thread.start()
+
+    def _stop_activity(self) -> None:
+        thread = self._activity_thread
+        if thread is not None:
+            self._activity_stop.set()
+            if thread is not threading.current_thread():
+                thread.join(timeout=0.25)
+        self._activity_thread = None
+        if self._activity_visible and self._live_output_supported():
+            with self._activity_lock:
+                self.output.write("\r\x1b[2K")
+                self.output.flush()
+        self._activity_visible = False
+
+    def _live_input_supported(self) -> bool:
+        return (
+            self.stream is None
+            and bool(getattr(sys.stdin, "isatty", lambda: False)())
+            and self._live_output_supported()
+        )
+
+    def _live_output_supported(self) -> bool:
+        return bool(getattr(self.output, "isatty", lambda: False)())
+
+    @staticmethod
+    def _windows_key(msvcrt: Any) -> str:
+        character = msvcrt.getwch()
+        if character in {"\x00", "\xe0"}:
+            return {
+                "H": "UP",
+                "P": "DOWN",
+                "K": "LEFT",
+                "M": "RIGHT",
+                "G": "HOME",
+                "O": "END",
+                "S": "DELETE",
+            }.get(msvcrt.getwch(), "UNKNOWN")
+        return Console._control_key(character)
+
+    @staticmethod
+    def _posix_key() -> str:
+        import select
+
+        character = sys.stdin.read(1)
+        if character != "\x1b":
+            return Console._control_key(character)
+        sequence = character
+        while select.select([sys.stdin], [], [], 0.015)[0] and len(sequence) < 4:
+            sequence += sys.stdin.read(1)
+        return {
+            "\x1b[A": "UP",
+            "\x1b[B": "DOWN",
+            "\x1b[C": "RIGHT",
+            "\x1b[D": "LEFT",
+            "\x1b[H": "HOME",
+            "\x1b[F": "END",
+            "\x1b[3~": "DELETE",
+        }.get(sequence, "ESCAPE")
+
+    @staticmethod
+    def _control_key(character: str) -> str:
+        return {
+            "\r": "ENTER",
+            "\n": "ENTER",
+            "\x03": "CTRL_C",
+            "\x04": "CTRL_D",
+            "\x01": "CTRL_A",
+            "\x05": "CTRL_E",
+            "\x15": "CTRL_U",
+            "\x08": "BACKSPACE",
+            "\x7f": "BACKSPACE",
+            "\t": "TAB",
+            "\x1b": "ESCAPE",
+        }.get(character, character)
+
+    @staticmethod
+    def _display_width(text: str) -> int:
+        width = 0
+        for character in text:
+            if unicodedata.combining(character):
+                continue
+            width += 2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1
+        return width
 
     def _tool_result(self, name: str, raw_result: str) -> None:
         try:

@@ -13,7 +13,12 @@
     <div class="app-shell" id="appShell">
       <aside class="sidebar" id="sidebar" aria-label="会话导航">
         <div class="brand-row">
-          <div class="brand-mark" aria-hidden="true">R</div>
+          <div class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none">
+              <circle cx="12" cy="12" r="2.25" />
+              <path d="M12 3.75v4M12 16.25v4M3.75 12h4M16.25 12h4M6.2 6.2 9 9m6 6 2.8 2.8M17.8 6.2 15 9m-6 6-2.8 2.8" />
+            </svg>
+          </div>
           <div>
             <div class="brand-name">Rivet</div>
             <div class="brand-subtitle">Coding Agent</div>
@@ -42,7 +47,12 @@
 
         <div class="section-heading sessions-heading">
           <span class="sessions-heading-copy">会话 <span class="session-count" id="sessionCount">0</span></span>
-          <button class="icon-button quiet" id="refreshSessionsButton" type="button" aria-label="刷新会话">↻</button>
+          <button class="icon-button quiet" id="refreshSessionsButton" type="button" aria-label="刷新会话">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M19 8a7.5 7.5 0 1 0 .25 7.5" />
+              <path d="M19 3.75V8h-4.25" />
+            </svg>
+          </button>
         </div>
 
         <nav class="session-list" id="sessionList" aria-label="当前工作目录的会话">
@@ -64,7 +74,9 @@
       <main class="main-panel">
         <header class="topbar">
           <div class="topbar-left">
-            <button class="icon-button panel-toggle" id="sidebarToggle" type="button" aria-label="打开会话列表">☰</button>
+            <button class="icon-button panel-toggle" id="sidebarToggle" type="button" aria-label="打开会话列表">
+              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
+            </button>
             <div>
               <div class="page-title" id="pageTitle">新会话</div>
               <div class="page-meta" id="pageMeta">准备本地会话</div>
@@ -75,16 +87,27 @@
               <span class="status-dot"></span>
               <span id="runStatusText">就绪</span>
             </div>
-            <button class="secondary-button" id="diffButton" type="button">查看改动</button>
-            <button class="secondary-button details-button" id="inspectorToggle" type="button">任务详情</button>
+            <button class="secondary-button" id="diffButton" type="button">
+              <svg class="button-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M7 5v14M17 5v14M4 8l3-3 3 3M14 16l3 3 3-3" /></svg>
+              <span>改动</span>
+            </button>
+            <button class="secondary-button details-button" id="inspectorToggle" type="button">
+              <svg class="button-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 5.5h14v13H5zM9 5.5v13" /></svg>
+              <span>详情</span>
+            </button>
           </div>
         </header>
 
         <section class="conversation" id="conversation" aria-live="polite">
           <div class="empty-state" id="emptyState">
-            <div class="empty-symbol" aria-hidden="true">✦</div>
-            <h1>准备好一起完成什么？</h1>
-            <p>描述目标即可。Rivet 会先理解项目，再规划、修改并验证结果。</p>
+            <div class="empty-symbol" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none">
+                <circle cx="12" cy="12" r="2.25" />
+                <path d="M12 3.75v4M12 16.25v4M3.75 12h4M16.25 12h4M6.2 6.2 9 9m6 6 2.8 2.8M17.8 6.2 15 9m-6 6-2.8 2.8" />
+              </svg>
+            </div>
+            <h1>今天要推进什么？</h1>
+            <p>描述目标，Rivet 会阅读当前项目、制定计划，并在完成修改后验证结果。</p>
           </div>
           <div class="message-list" id="messageList"></div>
         </section>
@@ -96,14 +119,17 @@
             <div class="composer-footer">
               <div class="composer-hint"><kbd>Enter</kbd> 发送 · <kbd>Shift</kbd> + <kbd>Enter</kbd> 换行</div>
               <button class="send-button" id="sendButton" type="submit" aria-label="发送消息">
-                <svg class="send-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <svg class="send-icon send-arrow" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                   <path d="m7 11 5-5 5 5" />
                   <path d="M12 18V6" />
+                </svg>
+                <svg class="send-icon stop-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <rect x="8" y="8" width="8" height="8" rx="1.25" />
                 </svg>
               </button>
             </div>
           </form>
-          <p class="local-note">Rivet 在本机运行。提交前请检查 Agent 产生的代码修改。</p>
+          <p class="local-note">仅在当前工作目录内运行 · 提交前请审阅代码改动</p>
         </footer>
       </main>
 
@@ -113,7 +139,9 @@
             <div class="inspector-title">任务详情</div>
             <div class="inspector-subtitle" id="turnSummary">尚未开始</div>
           </div>
-          <button class="icon-button inspector-close" id="inspectorClose" type="button" aria-label="关闭任务详情">×</button>
+          <button class="icon-button inspector-close" id="inspectorClose" type="button" aria-label="关闭任务详情">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg>
+          </button>
         </div>
 
         <div class="tab-list" role="tablist" aria-label="任务信息">
@@ -168,6 +196,7 @@
           <pre id="approvalSummary"></pre>
         </div>
         <div class="modal-actions">
+          <button class="secondary-button stop-task-button" id="stopApprovalTaskButton" type="button">停止任务</button>
           <button class="secondary-button" id="rejectApprovalButton" type="button">拒绝</button>
           <button class="danger-button" id="approveButton" type="button">允许一次</button>
         </div>
@@ -178,9 +207,26 @@
       <section class="modal diff-modal" role="dialog" aria-modal="true" aria-labelledby="diffTitle">
         <div class="diff-modal-header">
           <div><span class="eyebrow">SESSION DIFF</span><h2 id="diffTitle">本次会话改动</h2></div>
-          <button class="icon-button" id="closeDiffButton" type="button" aria-label="关闭改动窗口">×</button>
+          <button class="icon-button" id="closeDiffButton" type="button" aria-label="关闭改动窗口">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg>
+          </button>
         </div>
-        <pre class="diff-content" id="diffContent">正在读取…</pre>
+        <div class="diff-workspace">
+          <aside class="diff-file-panel" aria-label="改动文件">
+            <div class="diff-file-heading">
+              <span>文件</span>
+              <strong id="diffFileCount">0</strong>
+            </div>
+            <nav class="diff-file-list" id="diffFileList"></nav>
+          </aside>
+          <section class="diff-viewer" aria-label="文件差异">
+            <div class="diff-viewer-header">
+              <strong id="diffActivePath">本次会话尚无文件改动</strong>
+              <span id="diffSummary"></span>
+            </div>
+            <div class="diff-content" id="diffContent" tabindex="0">正在读取…</div>
+          </section>
+        </div>
       </section>
     </div>
 

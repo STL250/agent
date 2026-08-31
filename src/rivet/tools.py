@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -41,10 +42,13 @@ class ToolRegistry:
         *,
         plan: PlanState | None = None,
         event_handler: EventHandler | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         self.config = config
         self.workspace = Workspace(
-            config.workspace, max_output_chars=config.max_tool_output_chars
+            config.workspace,
+            max_output_chars=config.max_tool_output_chars,
+            cancel_event=cancel_event,
         )
         self.approver = approver
         self.plan = plan if plan is not None else PlanState()

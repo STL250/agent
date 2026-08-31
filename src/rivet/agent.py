@@ -3,12 +3,13 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
 from .config import Config
 from .context import ContextManager
-from .errors import SessionError
+from .errors import OperationCancelled, SessionError
 from .plan import PlanState
 from .prompt import system_prompt
 from .tools import Approver, ToolRegistry
@@ -197,6 +198,9 @@ class Agent:
         self.client = client
         self.events = event_handler or (lambda _event, _data: None)
         self.approver = approver
+        self._cancel_event = threading.Event()
+        self._run_state_lock = threading.Lock()
+        self._running = False
         self.reset()
 
     def reset(self) -> None:
@@ -207,6 +211,7 @@ class Agent:
             approver=self.approver,
             plan=self.plan,
             event_handler=self.events,
+            cancel_event=self._cancel_event,
         )
         self.context: ContextManager | None = None
         self.state = TaskState()
@@ -282,6 +287,7 @@ class Agent:
             approver=self.approver,
             plan=restored_plan,
             event_handler=self.events,
+            cancel_event=self._cancel_event,
         )
         try:
             drifted = restored_tools.workspace.restore_diff_state(
@@ -305,6 +311,32 @@ class Agent:
 
     def run(self, task: str) -> AgentResult:
         """Run one user turn while retaining earlier messages and workspace evidence."""
+        with self._run_state_lock:
+            if self._running:
+                raise RuntimeError("agent is already running")
+            self._cancel_event.clear()
+            reset_cancel = getattr(self.client, "reset_cancel", None)
+            if callable(reset_cancel):
+                reset_cancel()
+            self._running = True
+        try:
+            return self._run_turn(task)
+        finally:
+            with self._run_state_lock:
+                self._running = False
+
+    def request_cancel(self) -> bool:
+        """Request cooperative cancellation of the active model or tool operation."""
+        with self._run_state_lock:
+            if not self._running:
+                return False
+            self._cancel_event.set()
+        cancel_client = getattr(self.client, "cancel", None)
+        if callable(cancel_client):
+            cancel_client()
+        return True
+
+    def _run_turn(self, task: str) -> AgentResult:
         if not task.strip():
             return AgentResult(
                 False,
@@ -351,8 +383,10 @@ class Agent:
                 )
             self.events("model_start", {"step": step, "turn": turn})
             try:
+                self._raise_if_cancelled()
                 reply, streamed = self._complete_model(context.messages, step, turn)
-            except KeyboardInterrupt:
+                self._raise_if_cancelled()
+            except (KeyboardInterrupt, OperationCancelled):
                 return self._cancelled_result(context, state, step, turn, "model request")
             assistant_message = self._assistant_message(
                 reply.content, reply.tool_calls, reply.extensions
@@ -383,8 +417,9 @@ class Agent:
                         },
                     )
                     try:
+                        self._raise_if_cancelled()
                         result = self.tools.execute(call.name, call.arguments)
-                    except KeyboardInterrupt:
+                    except (KeyboardInterrupt, OperationCancelled):
                         result = self._cancelled_tool_payload(call.name)
                     state.record_tool_result(call.name, result)
                     context.append(
@@ -404,7 +439,7 @@ class Agent:
                             "result": result,
                         },
                     )
-                    if self._tool_was_cancelled(result):
+                    if self._tool_was_cancelled(result) or self._cancel_event.is_set():
                         for pending in reply.tool_calls[call_index + 1 :]:
                             context.append(
                                 {
@@ -609,6 +644,7 @@ class Agent:
 
         def on_text_delta(delta: str) -> None:
             nonlocal stream_started
+            self._raise_if_cancelled()
             if not delta:
                 return
             if not stream_started:
@@ -618,6 +654,7 @@ class Agent:
                 "assistant_text_delta",
                 {"text": delta, "step": step, "turn": turn},
             )
+            self._raise_if_cancelled()
 
         try:
             reply = stream(messages, self.tools.schemas, on_text_delta)
@@ -634,6 +671,10 @@ class Agent:
                 {"step": step, "turn": turn, "cancelled": False},
             )
         return reply, stream_started
+
+    def _raise_if_cancelled(self) -> None:
+        if self._cancel_event.is_set():
+            raise OperationCancelled("operation cancelled by user")
 
     def _cancelled_result(
         self,

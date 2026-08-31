@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
-import time
+import threading
 import urllib.error
 import urllib.request
 from typing import Any, BinaryIO
 
 from .config import Config
-from .errors import ModelError
+from .errors import ModelError, OperationCancelled
 from .types import JsonObject, Message, ModelReply, TextDeltaHandler, ToolCall
 
 
@@ -22,6 +22,22 @@ class OpenAICompatibleClient:
         self.config = config
         self.retries = retries
         self.endpoint = config.endpoint
+        self._cancelled = threading.Event()
+        self._response_lock = threading.Lock()
+        self._active_response: BinaryIO | None = None
+
+    def reset_cancel(self) -> None:
+        self._cancelled.clear()
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+        with self._response_lock:
+            response = self._active_response
+        if response is not None:
+            try:
+                response.close()
+            except (OSError, ValueError):
+                pass
 
     def complete(self, messages: list[Message], tools: list[JsonObject]) -> ModelReply:
         payload = self._request_payload(messages, tools, stream=False)
@@ -29,23 +45,35 @@ class OpenAICompatibleClient:
         headers = self._headers(stream=False)
 
         for attempt in range(self.retries + 1):
+            self._raise_if_cancelled()
             request = urllib.request.Request(
                 self.endpoint, data=encoded, headers=headers, method="POST"
             )
             try:
-                with urllib.request.urlopen(
+                response = urllib.request.urlopen(
                     request, timeout=self.config.request_timeout
-                ) as response:
+                )
+                self._set_active_response(response)
+                try:
+                    self._raise_if_cancelled()
                     raw = response.read().decode("utf-8")
+                finally:
+                    self._clear_active_response(response)
+                    response.close()
+                self._raise_if_cancelled()
                 return self._parse_response(raw)
+            except OperationCancelled:
+                raise
             except urllib.error.HTTPError as exc:
+                self._raise_if_cancelled()
                 if self._retry_http_error(exc, attempt):
                     continue
                 detail = exc.read(4_000).decode("utf-8", errors="replace")
                 raise ModelError(
                     f"model endpoint returned HTTP {exc.code}: {self._sanitize(detail)}"
                 ) from exc
-            except (urllib.error.URLError, TimeoutError) as exc:
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+                self._raise_if_cancelled()
                 if attempt < self.retries:
                     self._backoff(attempt)
                     continue
@@ -65,6 +93,7 @@ class OpenAICompatibleClient:
         headers = self._headers(stream=True)
 
         for attempt in range(self.retries + 1):
+            self._raise_if_cancelled()
             request = urllib.request.Request(
                 self.endpoint, data=encoded, headers=headers, method="POST"
             )
@@ -76,15 +105,25 @@ class OpenAICompatibleClient:
                 on_text_delta(delta)
 
             try:
-                with urllib.request.urlopen(
+                response = urllib.request.urlopen(
                     request, timeout=self.config.request_timeout
-                ) as response:
+                )
+                self._set_active_response(response)
+                try:
+                    self._raise_if_cancelled()
                     content_type = str(response.headers.get("Content-Type") or "")
                     if "text/event-stream" not in content_type.lower():
                         raw = response.read().decode("utf-8")
+                        self._raise_if_cancelled()
                         return self._parse_response(raw)
                     return self._parse_event_stream(response, emit)
+                finally:
+                    self._clear_active_response(response)
+                    response.close()
+            except OperationCancelled:
+                raise
             except urllib.error.HTTPError as exc:
+                self._raise_if_cancelled()
                 if not emitted and exc.code in STREAM_FALLBACK_STATUS:
                     exc.read(4_000)
                     return self.complete(messages, tools)
@@ -94,7 +133,8 @@ class OpenAICompatibleClient:
                 raise ModelError(
                     f"model endpoint returned HTTP {exc.code}: {self._sanitize(detail)}"
                 ) from exc
-            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+                self._raise_if_cancelled()
                 if not emitted and attempt < self.retries:
                     self._backoff(attempt)
                     continue
@@ -122,7 +162,7 @@ class OpenAICompatibleClient:
             **self.config.extra_headers,
             "Content-Type": "application/json",
             "Accept": "text/event-stream" if stream else "application/json",
-            "User-Agent": "rivet-code-agent/1.6",
+            "User-Agent": "rivet-code-agent/1.7",
         }
         if self.config.auth_style == "bearer" and self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
@@ -137,9 +177,22 @@ class OpenAICompatibleClient:
         self._backoff(attempt)
         return True
 
-    @staticmethod
-    def _backoff(attempt: int) -> None:
-        time.sleep(min(2**attempt, 4))
+    def _backoff(self, attempt: int) -> None:
+        if self._cancelled.wait(min(2**attempt, 4)):
+            raise OperationCancelled("model request cancelled")
+
+    def _set_active_response(self, response: BinaryIO) -> None:
+        with self._response_lock:
+            self._active_response = response
+
+    def _clear_active_response(self, response: BinaryIO) -> None:
+        with self._response_lock:
+            if self._active_response is response:
+                self._active_response = None
+
+    def _raise_if_cancelled(self) -> None:
+        if self._cancelled.is_set():
+            raise OperationCancelled("model request cancelled")
 
     def _parse_response(self, raw: str) -> ModelReply:
         try:
@@ -265,6 +318,7 @@ class OpenAICompatibleClient:
             return False
 
         while True:
+            self._raise_if_cancelled()
             raw_line = response.readline()
             if raw_line == b"":
                 consume_event()

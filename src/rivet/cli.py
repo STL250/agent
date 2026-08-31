@@ -126,7 +126,7 @@ def run_interactive(
 
     while True:
         try:
-            user_input = input_fn(console.prompt()).strip()
+            user_input = console.read_input(input_fn).strip()
         except KeyboardInterrupt:
             console.input_cancelled()
             continue

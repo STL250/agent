@@ -84,7 +84,11 @@ and approval policy are shared with the terminal interface.
 Model and tool events are returned as newline-delimited JSON over one streamed request. A
 mutating tool that needs confirmation emits an approval event and waits on a bounded local
 condition until the browser allows or rejects it. New-session, resume, status, and diff actions
-use small JSON endpoints. No provider credential is serialized to the browser.
+use small JSON endpoints. A separate cancel endpoint can interrupt the streamed model request,
+an approval wait, or a running command without closing the browser session. Assistant text is
+rendered through a safe DOM-based Markdown subset with copyable code blocks, while unified
+diffs are parsed into per-file, line-numbered views. No provider credential is serialized to
+the browser.
 
 The server is intentionally local-only: it rejects non-loopback host/origin values, requires a
 random per-process request token, sends no CORS permission, and applies a restrictive content
@@ -157,11 +161,12 @@ ignored, `[DONE]` and finish reasons close the stream, and a truncated or malfor
 fails explicitly. A compatible gateway that rejects streaming before emitting any content is
 retried through the existing JSON request.
 
-The Agent does not append an assistant message until a model stream is complete. `Ctrl+C`
-during a request discards partial text and records a short cancellation marker instead. If a
-tool is interrupted, synthetic cancellation results complete every advertised tool-call ID,
-so subsequent API requests never contain orphaned calls. `run_command` uses a process group;
-Windows termination uses `taskkill /T /F`, while POSIX sends signals to the process group.
+The Agent does not append an assistant message until a model stream is complete. `Ctrl+C` in
+the TUI or the Web stop action during a request discards partial text and records a short
+cancellation marker instead. If a tool is interrupted, synthetic cancellation results complete
+every advertised tool-call ID, so subsequent API requests never contain orphaned calls.
+`run_command` uses a process group; Windows assigns the shell and descendants to a Job Object
+and retains `taskkill /T /F` as a fallback, while POSIX sends signals to the process group.
 After termination, the normal workspace snapshot comparison still records partial file side
 effects. A cancelled verification command can never satisfy completion evidence. At an idle
 prompt, `Ctrl+C` clears the input and keeps the session open.

@@ -140,6 +140,15 @@ class WebRuntime:
             self.approval_condition.notify_all()
             return True
 
+    def cancel_turn(self) -> bool:
+        if not self.turn_lock.locked():
+            return False
+        with self.approval_condition:
+            if self.pending_approval is not None:
+                self.pending_approval["approved"] = False
+                self.approval_condition.notify_all()
+        return self.agent.request_cancel()
+
     def _approve(self, tool: str, summary: str) -> bool:
         approval_id = secrets.token_urlsafe(12)
         with self.approval_condition:
@@ -303,6 +312,13 @@ class RivetRequestHandler(BaseHTTPRequestHandler):
                 self._json_error("approval is no longer pending", HTTPStatus.CONFLICT)
                 return
             self._json_response({"ok": True})
+            return
+
+        if parsed.path == "/api/cancel":
+            if not runtime.cancel_turn():
+                self._json_error("there is no active turn to cancel", HTTPStatus.CONFLICT)
+                return
+            self._json_response({"ok": True, "cancel_requested": True})
             return
 
         try:
