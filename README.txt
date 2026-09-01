@@ -2,6 +2,8 @@ Rivet 编程智能体
 
 Git 仓库：https://github.com/STL250/agent
 
+CI/CD：https://github.com/STL250/agent/actions/workflows/ci-cd.yml
+
 运行环境：Python 3.10 及以上，无运行时第三方依赖。
 
 安装与运行：首次在源码目录执行 python -m pip install -e .，并复制 .env.example 为 .env 填写模型配置。以后只需在任意项目根目录执行 rivet，即以当前目录启动 TUI；网页界面执行 rivet --web。配置自动查找用户目录 .rivet/.env、Rivet 源码目录 .env 和当前目录 .env，也可用 RIVET_ENV_FILE 或 --env-file 指定。终端输入 / 会显示可筛选的命令菜单，支持方向键选择与 Tab 补全；执行期间动态显示模型和工具的工作状态。输入 /skills 可查看当前可用及已使用的技能，/permissions [safe|ask|never] 可即时切换当前进程的审批策略。Web 顶栏提供相同的模式选择器；任务执行或等待审批期间不能切换，重启后仍以启动参数或 .env 为准。
@@ -15,4 +17,6 @@ Skills：启动新会话时，Rivet 会发现内置技能、用户目录 ~/.rive
 流式与中断：模型文本通过 SSE 实时显示，分片的工具名、调用 ID 和 JSON 参数按索引重组；不支持流式的兼容网关自动回退。Ctrl+C 取消当前模型请求、审批或命令并回到输入框，不退出会话。命令中断会终止子进程树、追踪取消前已产生的文件变化，且不会把不完整回复或取消的验证记为成功。
 
 架构设计与安全边界见 docs/ARCHITECTURE.md。API key 仅通过系统环境变量或 Git 已忽略的 .env 提供，不得写入源代码、仓库或展示材料。
+
+持续集成与发布：GitHub Actions 会在向 main 分支推送以及提交 Pull Request 时，自动执行 Windows/Linux、Python 3.10/3.13 兼容检查、上下文压缩回归、Web UI JavaScript 语法检查和 Python 包构建检查。工作流不会读取 .env，也不需要配置模型 API key。发布版本时，先把 pyproject.toml 中的 version 更新为 X.Y.Z，再创建并推送与之对应的 vX.Y.Z 标签；全部检查通过后，工作流会自动创建 GitHub Release，并上传 wheel 与源码包。
 
