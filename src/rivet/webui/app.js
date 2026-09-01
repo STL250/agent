@@ -114,6 +114,11 @@ let liveTurnNumber = 0;
 let activeRecovery = null;
 let compacting = false;
 let approvalChanging = false;
+const STREAM_RECORD_BATCH_SIZE = 64;
+
+function productMessage(message) {
+  return String(message ?? "").replace(/\bRivet\b/g, "CAworker");
+}
 
 async function request(path, options = {}) {
   const headers = new Headers(options.headers || {});
@@ -130,7 +135,7 @@ async function request(path, options = {}) {
     } catch (_) {
       // Keep the stable status message.
     }
-    throw new Error(message);
+    throw new Error(productMessage(message));
   }
   return response;
 }
@@ -174,7 +179,7 @@ function setRunError(message) {
   ui.runStatus.className = "run-status error";
   ui.runStatusText.textContent = "已停止";
   clearThinking();
-  toast(message, "error");
+  toast(productMessage(message), "error");
 }
 
 function contextCanCompact() {
@@ -236,7 +241,7 @@ function showThinking(step) {
   spinner.className = "thinking-spinner";
   spinner.setAttribute("aria-hidden", "true");
   const label = document.createElement("strong");
-  label.textContent = "Rivet 正在思考";
+  label.textContent = "CAworker 正在思考";
   const meta = document.createElement("span");
   meta.textContent = `第 ${step} 步`;
   row.append(spinner, label, meta);
@@ -428,14 +433,22 @@ function queueAssistantRender(message) {
   if (message.frame) return;
   message.frame = window.requestAnimationFrame(() => {
     message.frame = null;
-    renderMarkdown(message.body, message.raw);
+    appendPendingAssistantText(message);
     scrollToBottom();
   });
+}
+
+function appendPendingAssistantText(message) {
+  if (!message.pendingText || !message.textNode) return;
+  message.textNode.appendData(message.pendingText);
+  message.pendingText = "";
 }
 
 function flushAssistantRender(message) {
   if (message.frame) window.cancelAnimationFrame(message.frame);
   message.frame = null;
+  appendPendingAssistantText(message);
+  message.body.classList.remove("streaming-plain");
   renderMarkdown(message.body, message.raw);
 }
 
@@ -462,12 +475,19 @@ function addMessage(role, text, { streaming = false, turn = null } = {}) {
   content.className = "message-content";
   const label = document.createElement("div");
   label.className = "message-label";
-  label.textContent = role === "assistant" ? "Rivet" : "You";
+  label.textContent = role === "assistant" ? "CAworker" : "You";
   const body = document.createElement("div");
   body.className = "message-text";
+  let textNode = null;
   if (role === "assistant") {
     body.classList.add("markdown-body");
-    renderMarkdown(body, text);
+    if (streaming) {
+      body.classList.add("streaming-plain");
+      textNode = document.createTextNode(text);
+      body.append(textNode);
+    } else {
+      renderMarkdown(body, text);
+    }
   } else {
     body.textContent = text;
   }
@@ -475,7 +495,7 @@ function addMessage(role, text, { streaming = false, turn = null } = {}) {
   article.append(avatar, content);
   ui.messages.append(article);
   scrollToBottom();
-  return { article, body, raw: text, frame: null };
+  return { article, body, raw: text, textNode, pendingText: "", frame: null };
 }
 
 function addSystemNote(text) {
@@ -504,6 +524,7 @@ function toolLabel(name) {
     list_files: "浏览文件",
     read_file: "读取文件",
     search_text: "搜索代码",
+    search_history: "检索压缩历史",
     write_file: "写入文件",
     replace_text: "修改文件",
     show_diff: "检查改动",
@@ -1196,6 +1217,7 @@ function handleEvent(event, data) {
       break;
     case "assistant_text_delta":
       if (!activeAssistant) activeAssistant = addMessage("assistant", "", { streaming: true, turn: data.turn || liveTurnNumber });
+      activeAssistant.pendingText += data.text || "";
       activeAssistant.raw += data.text || "";
       lastAssistantText = activeAssistant.raw;
       queueAssistantRender(activeAssistant);
@@ -1260,7 +1282,7 @@ function handleEvent(event, data) {
       );
       break;
     case "verification_required":
-      addSystemNote("文件已修改，Rivet 正在执行必要的验证");
+      addSystemNote("文件已修改，CAworker 正在执行必要的验证");
       addActivity("等待验证", `${(data.files || []).length} 个文件`, "warning");
       break;
     case "plan_completion_required":
@@ -1332,6 +1354,7 @@ async function consumeTurnResponse(response) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let recordsSinceYield = 0;
   while (true) {
     const { value, done } = await reader.read();
     buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
@@ -1340,6 +1363,11 @@ async function consumeTurnResponse(response) {
     for (const line of lines) {
       if (!line.trim()) continue;
       handleRecord(JSON.parse(line));
+      recordsSinceYield += 1;
+      if (recordsSinceYield >= STREAM_RECORD_BATCH_SIZE) {
+        recordsSinceYield = 0;
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      }
     }
     if (done) break;
   }
@@ -1556,7 +1584,7 @@ async function exportSession(id) {
     const blob = await response.blob();
     const disposition = response.headers.get("Content-Disposition") || "";
     const match = /filename\*=UTF-8''([^;]+)/i.exec(disposition);
-    const filename = match ? decodeURIComponent(match[1]) : `rivet-${id}.md`;
+    const filename = match ? decodeURIComponent(match[1]) : `caworker-${id}.md`;
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
@@ -1874,7 +1902,7 @@ function renderDiff(diff) {
     ui.diffSummary.replaceChildren();
     const empty = document.createElement("div");
     empty.className = "diff-empty";
-    empty.textContent = "Rivet 修改文件后，差异会按文件显示在这里。";
+    empty.textContent = "CAworker 修改文件后，差异会按文件显示在这里。";
     ui.diffContent.replaceChildren(empty);
     return;
   }
@@ -1947,7 +1975,7 @@ async function bootstrap() {
     renderSnapshot(snapshot, { renderMessages: true });
     setBusy(Boolean(snapshot.busy), snapshot.busy ? "正在运行" : "就绪");
   } catch (error) {
-    setRunError(`无法连接本地 Rivet：${error.message}`);
+    setRunError(`无法连接本地 CAworker：${error.message}`);
   }
 }
 

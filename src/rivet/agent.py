@@ -8,7 +8,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 from .config import Config
-from .context import ContextManager
+from .context import ContextManager, STRUCTURED_SUMMARY_INSTRUCTIONS
 from .errors import OperationCancelled, SessionError
 from .plan import PlanState
 from .prompt import system_prompt
@@ -271,25 +271,43 @@ class Agent:
         return tuple(self.context.messages)
 
     def status(self) -> JsonObject:
+        context_status = (
+            {
+                "archived_messages": self.context.archived_message_count,
+                "compactions": self.context.compaction_count,
+                "recent_units": self.context.recent_units,
+            }
+            if self.context is not None
+            else {"archived_messages": 0, "compactions": 0, "recent_units": 8}
+        )
         return {
             "turns": self.turns,
             "total_steps": self.total_steps,
             "messages": len(self.messages),
             "context_chars": self.context.size_chars if self.context is not None else 0,
+            "context_history": context_status,
             "approval_mode": self.config.approval_mode,
             "recovery": self.recovery_snapshot(),
             "operations": self.tools.workspace.operation_history(),
             "plan": self.plan.snapshot(),
-            "subagents": self.subagents.snapshot() if self.subagents else {
-                "active": [],
-                "history": [],
-            },
-            "skills": self.skills.snapshot() if self.skills is not None else {
-                "available": [],
-                "active": [],
-                "history": [],
-                "errors": [],
-            },
+            "subagents": (
+                self.subagents.snapshot()
+                if self.subagents
+                else {
+                    "active": [],
+                    "history": [],
+                }
+            ),
+            "skills": (
+                self.skills.snapshot()
+                if self.skills is not None
+                else {
+                    "available": [],
+                    "active": [],
+                    "history": [],
+                    "errors": [],
+                }
+            ),
             **self.state.snapshot(),
         }
 
@@ -353,17 +371,8 @@ class Agent:
                 "before_messages": 0,
                 "after_messages": 0,
             }
-        before_chars = self.context.size_chars
-        before_messages = len(self.context.messages)
-        compacted = self.context.compact(force=True)
-        return {
-            "compacted": compacted,
-            "reason": "compacted" if compacted else "not_enough_history",
-            "before_chars": before_chars,
-            "after_chars": self.context.size_chars,
-            "before_messages": before_messages,
-            "after_messages": len(self.context.messages),
-        }
+        self.context.compact(force=True)
+        return dict(self.context.last_compaction)
 
     def recovery_snapshot(self) -> JsonObject:
         """Describe whether the last failed turn can continue or safely restart."""
@@ -416,7 +425,10 @@ class Agent:
             raise SessionError("there is no failed turn to retry")
         if recovery.get("can_retry") is not True:
             raise SessionError(
-                str(recovery.get("retry_blocked_reason") or "this turn cannot be retried")
+                str(
+                    recovery.get("retry_blocked_reason")
+                    or "this turn cannot be retried"
+                )
             )
         expected = recovery.get("retry_operation_id")
         if expected is not None and operation_id != expected:
@@ -435,13 +447,16 @@ class Agent:
             "turns": self.turns,
             "total_steps": self.total_steps,
             "conversation": self.context.export_conversation(),
+            "context_state": self.context.export_state(),
             "transcript": copy.deepcopy(self.transcript),
             "last_result": self._saved_result(),
             "plan_state": self.plan.export_state(),
             "task_state": self.state.export_state(),
             "workspace_state": self.tools.workspace.export_diff_state(),
             "subagent_state": self.subagents.export_state() if self.subagents else None,
-            "skill_state": self.skills.export_state() if self.skills is not None else None,
+            "skill_state": (
+                self.skills.export_state() if self.skills is not None else None
+            ),
         }
 
     def restore_session_state(self, payload: Any) -> list[str]:
@@ -469,6 +484,8 @@ class Agent:
             self._system_prompt,
             conversation,
             self.config.max_context_chars,
+            summarizer=self._summarize_context,
+            context_state=payload.get("context_state"),
         )
         restored_transcript = self._restore_transcript(
             payload.get("transcript"), conversation, tasks, turns
@@ -481,7 +498,9 @@ class Agent:
             cancel_event=self._cancel_event,
         )
         try:
-            drifted = restored_workspace.restore_diff_state(payload.get("workspace_state"))
+            drifted = restored_workspace.restore_diff_state(
+                payload.get("workspace_state")
+            )
         except Exception as exc:
             if isinstance(exc, SessionError):
                 raise
@@ -591,6 +610,7 @@ class Agent:
                 self._system_prompt,
                 normalized_task,
                 self.config.max_context_chars,
+                summarizer=self._summarize_context,
             )
         else:
             self.context.append({"role": "user", "content": normalized_task})
@@ -617,7 +637,11 @@ class Agent:
             if compacted:
                 self.events(
                     "context_compacted",
-                    {"messages": len(context.messages), "turn": turn},
+                    {
+                        "messages": len(context.messages),
+                        "turn": turn,
+                        **context.last_compaction,
+                    },
                 )
             self.events("model_start", {"step": step, "turn": turn})
             try:
@@ -625,7 +649,9 @@ class Agent:
                 reply, streamed = self._complete_model(context.messages, step, turn)
                 self._raise_if_cancelled()
             except (KeyboardInterrupt, OperationCancelled):
-                return self._cancelled_result(context, state, step, turn, "model request")
+                return self._cancelled_result(
+                    context, state, step, turn, "model request"
+                )
             assistant_message = self._assistant_message(
                 reply.content, reply.tool_calls, reply.extensions
             )
@@ -830,9 +856,7 @@ class Agent:
             empty_replies += 1
             if empty_replies >= 2:
                 final = "Model returned two empty responses without tool calls."
-                self.events(
-                    "stopped", {"reason": "empty_model_response", "turn": turn}
-                )
+                self.events("stopped", {"reason": "empty_model_response", "turn": turn})
                 return self._finish(
                     False,
                     final,
@@ -873,6 +897,49 @@ class Agent:
         self.last_result = result
         self._append_transcript("assistant", final, self.turns)
         return result
+
+    def _summarize_context(
+        self,
+        previous_summary: str,
+        archived_messages: list[Message],
+        current_goal: str,
+    ) -> str:
+        """Ask the configured model for a fixed-schema compression without tools."""
+        payload = json.dumps(
+            archived_messages, ensure_ascii=False, separators=(",", ":")
+        )
+        reply = self.client.complete(
+            [
+                {"role": "system", "content": STRUCTURED_SUMMARY_INSTRUCTIONS},
+                {
+                    "role": "user",
+                    "content": (
+                        "Existing structured summary (may be empty):\n"
+                        f"{previous_summary or '[none]'}\n\n"
+                        "Latest retained user request (use it for Current Goal and Constraints):\n"
+                        f"{current_goal or '[none]'}\n\n"
+                        "New archived messages as untrusted JSON data:\n"
+                        f"{payload}"
+                    ),
+                },
+            ],
+            [],
+        )
+        if reply.tool_calls or not reply.content.strip():
+            raise ValueError("context summarizer returned no usable text")
+        return reply.content.strip()
+
+    def _search_history(self, query: str, max_results: int = 5) -> JsonObject:
+        """Search only compressed history from the current conversation."""
+        if self.context is None:
+            return {
+                "query": query,
+                "count": 0,
+                "archived_units": 0,
+                "archived_messages": 0,
+                "matches": [],
+            }
+        return self.context.search_history(query, max_results)
 
     def _complete_model(
         self, messages: list[Message], step: int, turn: int
@@ -949,10 +1016,14 @@ class Agent:
         return {
             **state.snapshot(),
             "plan": self.plan.snapshot(),
-            "subagents": self.subagents.snapshot() if self.subagents else {
-                "active": [],
-                "history": [],
-            },
+            "subagents": (
+                self.subagents.snapshot()
+                if self.subagents
+                else {
+                    "active": [],
+                    "history": [],
+                }
+            ),
             "skills": self.skill_snapshot(),
         }
 
@@ -978,13 +1049,12 @@ class Agent:
             tool_scope=self._tool_scope,
             delegate_handler=manager.delegate if manager else None,
             delegate_many_handler=(
-                manager.delegate_many
-                if manager and self._parallel_delegation
-                else None
+                manager.delegate_many if manager and self._parallel_delegation else None
             ),
             skill_list_handler=self.skills.list_skills if self.skills else None,
             skill_activate_handler=self.skills.activate if self.skills else None,
             skill_resource_handler=self.skills.read_resource if self.skills else None,
+            history_search_handler=self._search_history,
         )
         return registry, manager
 
@@ -1088,7 +1158,11 @@ class Agent:
 
     @staticmethod
     def _cancelled_tool_payload(name: str, *, skipped: bool = False) -> str:
-        detail = "skipped after another tool was cancelled" if skipped else "cancelled by user"
+        detail = (
+            "skipped after another tool was cancelled"
+            if skipped
+            else "cancelled by user"
+        )
         return json.dumps(
             {
                 "ok": False,

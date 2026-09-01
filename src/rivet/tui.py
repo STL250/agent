@@ -58,6 +58,7 @@ class Console:
         "list_files": "List",
         "read_file": "Read",
         "search_text": "Search",
+        "search_history": "Search history",
         "write_file": "Write",
         "replace_text": "Edit",
         "show_diff": "Diff",

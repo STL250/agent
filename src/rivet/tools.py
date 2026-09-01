@@ -15,6 +15,7 @@ from .workspace import Workspace
 Approver = Callable[[str, str], bool]
 DelegateHandler = Callable[..., JsonObject]
 SkillHandler = Callable[..., JsonObject]
+HistorySearchHandler = Callable[..., JsonObject]
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,7 @@ class ToolRegistry:
         skill_list_handler: SkillHandler | None = None,
         skill_activate_handler: SkillHandler | None = None,
         skill_resource_handler: SkillHandler | None = None,
+        history_search_handler: HistorySearchHandler | None = None,
     ) -> None:
         self.config = config
         self.workspace = workspace or Workspace(
@@ -70,9 +72,17 @@ class ToolRegistry:
         self.skill_list_handler = skill_list_handler
         self.skill_activate_handler = skill_activate_handler
         self.skill_resource_handler = skill_resource_handler
+        self.history_search_handler = history_search_handler
         tools = self._build_tools()
         if tool_scope == "read_only":
-            allowed = {"update_plan", "list_files", "read_file", "search_text", "show_diff"}
+            allowed = {
+                "update_plan",
+                "list_files",
+                "read_file",
+                "search_text",
+                "search_history",
+                "show_diff",
+            }
             tools = tuple(tool for tool in tools if tool.name in allowed)
         self._tools = {tool.name: tool for tool in tools}
 
@@ -111,7 +121,9 @@ class ToolRegistry:
                 )
             review_reason = None
             if name == "run_command":
-                review_reason = self.workspace.command_review_reason(arguments["command"])
+                review_reason = self.workspace.command_review_reason(
+                    arguments["command"]
+                )
             needs_approval = self.config.approval_mode == "ask" or (
                 self.config.approval_mode == "safe" and review_reason is not None
             )
@@ -219,7 +231,11 @@ class ToolRegistry:
             if isinstance(maximum, int) and len(value) > maximum:
                 return f"{field} must not exceed {maximum} characters", field
 
-        if expected == "integer" and isinstance(value, int) and not isinstance(value, bool):
+        if (
+            expected == "integer"
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+        ):
             minimum = schema.get("minimum")
             maximum = schema.get("maximum")
             if isinstance(minimum, int) and value < minimum:
@@ -292,7 +308,11 @@ class ToolRegistry:
                             "description": "Workspace-relative directory",
                         },
                         "depth": {"type": "integer", "minimum": 0, "maximum": 8},
-                        "max_entries": {"type": "integer", "minimum": 1, "maximum": 2000},
+                        "max_entries": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 2000,
+                        },
                     },
                 },
                 self.workspace.list_files,
@@ -325,81 +345,144 @@ class ToolRegistry:
                             "maxLength": 500,
                             "description": "For example *.py",
                         },
-                        "max_results": {"type": "integer", "minimum": 1, "maximum": 1000},
+                        "max_results": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 1000,
+                        },
                         "case_sensitive": {"type": "boolean"},
                     },
                     "required": ["query"],
                 },
                 self.workspace.search_text,
             ),
-            ToolSpec(
-                "write_file",
-                "Create or replace a UTF-8 file atomically. Parent directories are created.",
-                {
-                    **object_schema,
-                    "properties": {
-                        "path": {"type": "string", "minLength": 1, "maxLength": 2000},
-                        "content": {"type": "string", "maxLength": 2000000},
+        ]
+        if self.history_search_handler is not None:
+            tools.append(
+                ToolSpec(
+                    "search_history",
+                    "Keyword-search raw messages archived by context compression in the "
+                    "current session. Use it only when the structured summary lacks an "
+                    "important historical detail. This is read-only and uses no embeddings "
+                    "or vector database.",
+                    {
+                        **object_schema,
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 500,
+                            },
+                            "max_results": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 10,
+                            },
+                        },
+                        "required": ["query"],
                     },
-                    "required": ["path", "content"],
-                },
-                self.workspace.write_file,
-                mutating=True,
-            ),
-            ToolSpec(
-                "replace_text",
-                "Atomically replace exact text in a UTF-8 file. Fails if the old text is absent.",
-                {
-                    **object_schema,
-                    "properties": {
-                        "path": {"type": "string", "minLength": 1, "maxLength": 2000},
-                        "old": {"type": "string", "minLength": 1, "maxLength": 500000},
-                        "new": {"type": "string", "maxLength": 500000},
-                        "count": {"type": "integer", "minimum": 1},
+                    self.history_search_handler,
+                )
+            )
+        tools.extend(
+            [
+                ToolSpec(
+                    "write_file",
+                    "Create or replace a UTF-8 file atomically. Parent directories are created.",
+                    {
+                        **object_schema,
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 2000,
+                            },
+                            "content": {"type": "string", "maxLength": 2000000},
+                        },
+                        "required": ["path", "content"],
                     },
-                    "required": ["path", "old", "new"],
-                },
-                self.workspace.replace_text,
-                mutating=True,
-            ),
-            ToolSpec(
-                "show_diff",
-                "Show unified diffs for files changed by Rivet during the current task.",
-                {
-                    **object_schema,
-                    "properties": {
-                        "path": {"type": "string", "minLength": 1, "maxLength": 2000},
-                        "context_lines": {"type": "integer", "minimum": 0, "maximum": 20},
+                    self.workspace.write_file,
+                    mutating=True,
+                ),
+                ToolSpec(
+                    "replace_text",
+                    "Atomically replace exact text in a UTF-8 file. Fails if the old text is absent.",
+                    {
+                        **object_schema,
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 2000,
+                            },
+                            "old": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 500000,
+                            },
+                            "new": {"type": "string", "maxLength": 500000},
+                            "count": {"type": "integer", "minimum": 1},
+                        },
+                        "required": ["path", "old", "new"],
                     },
-                },
-                self.workspace.show_diff,
-            ),
-            ToolSpec(
-                "run_command",
-                "Run a shell command in the workspace. Output and exit status are bounded; "
-                "created, modified, and deleted workspace files are detected and reported.",
-                {
-                    **object_schema,
-                    "properties": {
-                        "command": {"type": "string", "minLength": 1, "maxLength": 10000},
-                        "timeout": {"type": "integer", "minimum": 1, "maximum": 600},
-                        "purpose": {
-                            "type": "string",
-                            "enum": ["auto", "inspect", "verify"],
-                            "description": (
-                                "Use verify only when the command checks the latest changes; "
-                                "inspect commands never satisfy completion evidence."
-                            ),
+                    self.workspace.replace_text,
+                    mutating=True,
+                ),
+                ToolSpec(
+                    "show_diff",
+                    "Show unified diffs for files changed by Rivet during the current task.",
+                    {
+                        **object_schema,
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 2000,
+                            },
+                            "context_lines": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 20,
+                            },
                         },
                     },
-                    "required": ["command"],
-                },
-                lambda command, timeout=self.config.command_timeout, purpose="auto": self.workspace.run_command(
-                    command, timeout, purpose
+                    self.workspace.show_diff,
                 ),
-                mutating=True,
-            ),
-        ]
+                ToolSpec(
+                    "run_command",
+                    "Run a shell command in the workspace. Output and exit status are bounded; "
+                    "created, modified, and deleted workspace files are detected and reported.",
+                    {
+                        **object_schema,
+                        "properties": {
+                            "command": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 10000,
+                            },
+                            "timeout": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 600,
+                            },
+                            "purpose": {
+                                "type": "string",
+                                "enum": ["auto", "inspect", "verify"],
+                                "description": (
+                                    "Use verify only when the command checks the latest changes; "
+                                    "inspect commands never satisfy completion evidence."
+                                ),
+                            },
+                        },
+                        "required": ["command"],
+                    },
+                    lambda command, timeout=self.config.command_timeout, purpose="auto": self.workspace.run_command(
+                        command, timeout, purpose
+                    ),
+                    mutating=True,
+                ),
+            ]
+        )
         if self.delegate_handler is not None:
             tools.append(
                 ToolSpec(

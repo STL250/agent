@@ -1155,6 +1155,10 @@ textarea:focus-visible {
   white-space: normal;
 }
 
+.markdown-body.streaming-plain {
+  white-space: pre-wrap;
+}
+
 .markdown-body > :first-child {
   margin-top: 0;
 }
