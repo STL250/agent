@@ -5,7 +5,9 @@ __pycache__/
 .vscode/
 .venv/
 .env
-.rivet/
+.rivet/*
+!.rivet/skills/
+!.rivet/skills/**
 dist/
 build/
 

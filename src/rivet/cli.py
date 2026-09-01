@@ -179,6 +179,27 @@ def run_interactive(
                 else:
                     console.plan(agent.plan_snapshot())
                 continue
+            if command == "/skills":
+                if argument:
+                    console.warning("/skills does not accept an argument.")
+                else:
+                    console.skills(agent.skill_snapshot())
+                continue
+            if command == "/permissions":
+                if not argument:
+                    console.notice(
+                        f"Approval mode: {agent.config.approval_mode}. "
+                        "Use /permissions safe, ask, or never."
+                    )
+                    continue
+                try:
+                    update = agent.set_approval_mode(argument)
+                except RivetError as exc:
+                    console.error(str(exc))
+                    continue
+                state = "changed" if update.get("changed") else "unchanged"
+                console.notice(f"Approval mode {state}: {update['mode']}.")
+                continue
             if command == "/diff":
                 try:
                     console.diff(agent.show_diff(argument or None), argument or None)

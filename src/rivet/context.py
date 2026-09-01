@@ -52,8 +52,14 @@ class ContextManager:
     def append(self, message: Message) -> None:
         self.messages.append(message)
 
-    def compact(self) -> bool:
-        if self._size(self.messages) <= self.max_chars:
+    @property
+    def size_chars(self) -> int:
+        """Return the same approximate size used by context compaction."""
+        return self._size(self.messages)
+
+    def compact(self, *, force: bool = False) -> bool:
+        before_size = self._size(self.messages)
+        if not force and before_size <= self.max_chars:
             return False
 
         fixed = self.messages[:2]
@@ -63,8 +69,15 @@ class ContextManager:
             previous_summary = str(body.pop(0).get("content") or "")
 
         units = self._group_units(body)
+        if len(units) <= 1:
+            return False
         keep: list[list[Message]] = []
-        target = max(self.max_chars * 3 // 5, 4_000)
+        automatic_target = self.max_chars * 3 // 5
+        forced_target = before_size * 3 // 5
+        target = max(
+            min(automatic_target, forced_target) if force else automatic_target,
+            4_000,
+        )
         running = self._size(fixed)
         for unit in reversed(units):
             unit_size = self._size(unit)
@@ -88,7 +101,10 @@ class ContextManager:
             "name": self.SUMMARY_NAME,
             "content": "[Compacted prior activity; facts only]\n" + summary,
         }
-        self.messages = fixed + [summary_message] + [message for unit in keep for message in unit]
+        compacted = fixed + [summary_message] + [message for unit in keep for message in unit]
+        if self._size(compacted) >= before_size:
+            return False
+        self.messages = compacted
         return True
 
     @staticmethod

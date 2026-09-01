@@ -243,8 +243,8 @@ class Config:
     replay_fields: tuple[str, ...] = ("reasoning_content",)
     env_file: Path | None = None
     subagent_max_steps: int = 12
-    max_subagents_per_turn: int = 4
-    subagent_parallelism: int = 3
+    max_subagents_per_turn: int = 2
+    subagent_parallelism: int = 2
 
     @property
     def endpoint(self) -> str:
@@ -349,10 +349,10 @@ class Config:
                 settings, "RIVET_SUBAGENT_MAX_STEPS", 12, 100
             ),
             max_subagents_per_turn=_bounded_positive_int(
-                settings, "RIVET_MAX_SUBAGENTS_PER_TURN", 4, 16
+                settings, "RIVET_MAX_SUBAGENTS_PER_TURN", 2, 16
             ),
             subagent_parallelism=_bounded_positive_int(
-                settings, "RIVET_SUBAGENT_PARALLELISM", 3, 3
+                settings, "RIVET_SUBAGENT_PARALLELISM", 2, 3
             ),
             approval_mode=chosen_approval,
             protocol=chosen_protocol,

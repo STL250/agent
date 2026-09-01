@@ -4,7 +4,7 @@ import copy
 import hashlib
 import json
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 from .config import Config
@@ -12,6 +12,7 @@ from .context import ContextManager
 from .errors import OperationCancelled, SessionError
 from .plan import PlanState
 from .prompt import system_prompt
+from .skills import SkillRegistry
 from .subagents import SubAgentManager
 from .tools import Approver, ToolRegistry
 from .types import EventHandler, JsonObject, Message, ModelClient, ModelReply, ToolCall
@@ -125,6 +126,9 @@ class TaskState:
                 ),
                 "file_changes_truncated": bool(payload.get("file_changes_truncated")),
                 "tracking_complete": payload.get("tracking_complete") is not False,
+                "stdout": str(payload.get("stdout") or "")[:8_000],
+                "stderr": str(payload.get("stderr") or "")[:8_000],
+                "duration_ms": payload.get("duration_ms"),
             }
             self.commands.append(command_record)
             if (
@@ -134,33 +138,6 @@ class TaskState:
                 and not command_record["cancelled"]
             ):
                 self.last_successful_command_operation = self.operation_index
-        elif name in {"delegate_task", "delegate_readonly_tasks"}:
-            reports = payload.get("reports") if name == "delegate_readonly_tasks" else [payload]
-            if not isinstance(reports, list):
-                return
-            changed_reports: list[JsonObject] = []
-            for report in reports:
-                if not isinstance(report, dict):
-                    continue
-                if report.get("tracking_complete") is False:
-                    self.workspace_tracking_complete = False
-                changed = report.get("changed_files", [])
-                if not isinstance(changed, list):
-                    continue
-                report_changed = [item for item in changed if isinstance(item, str)]
-                if report_changed:
-                    self.changed_files.update(report_changed)
-                    changed_reports.append(report)
-            if changed_reports:
-                self.last_mutation_operation = self.operation_index
-                all_verified = all(
-                    isinstance(report.get("verification"), dict)
-                    and report["verification"].get("passed") is True
-                    for report in changed_reports
-                )
-                if all_verified:
-                    self.operation_index += 1
-                    self.last_successful_command_operation = self.operation_index
 
     @property
     def verification_required(self) -> bool:
@@ -201,6 +178,14 @@ class TaskState:
         self.last_mutation_operation = self.operation_index
         self.changed_files.update(paths)
 
+    def record_revert(self, reverted: list[str], remaining: list[str]) -> None:
+        if not reverted:
+            return
+        self.operation_index += 1
+        self.changed_files = {item for item in remaining if isinstance(item, str)}
+        if self.changed_files:
+            self.last_mutation_operation = self.operation_index
+
 
 @dataclass(frozen=True)
 class AgentResult:
@@ -240,13 +225,30 @@ class Agent:
         self._enable_delegation = enable_delegation
         self._cancel_event = cancel_event or threading.Event()
         self._owns_cancel_event = cancel_event is None
-        self._system_prompt = system_prompt_text or system_prompt(self.config.workspace)
+        self.skills = (
+            SkillRegistry(self.config.workspace, event_handler=self.events)
+            if tool_scope == "full" and system_prompt_text is None
+            else None
+        )
+        self._system_prompt = system_prompt_text or system_prompt(
+            self.config.workspace,
+            (
+                self.skills.catalog_prompt()
+                if self.skills is not None
+                else "- No skills are currently available."
+            ),
+        )
         self._run_state_lock = threading.Lock()
         self._running = False
         self.reset()
 
     def reset(self) -> None:
         """Start a new conversation and a new in-memory workspace diff baseline."""
+        if self.skills is not None:
+            self.skills.reset_session()
+            self._system_prompt = system_prompt(
+                self.config.workspace, self.skills.catalog_prompt()
+            )
         self.plan = PlanState()
         workspace = self._shared_workspace or Workspace(
             self.config.workspace,
@@ -255,6 +257,7 @@ class Agent:
         )
         self.tools, self.subagents = self._build_runtime(self.plan, workspace)
         self.context: ContextManager | None = None
+        self.transcript: list[JsonObject] = []
         self.state = TaskState()
         self.tasks: list[str] = []
         self.turns = 0
@@ -272,10 +275,20 @@ class Agent:
             "turns": self.turns,
             "total_steps": self.total_steps,
             "messages": len(self.messages),
+            "context_chars": self.context.size_chars if self.context is not None else 0,
+            "approval_mode": self.config.approval_mode,
+            "recovery": self.recovery_snapshot(),
+            "operations": self.tools.workspace.operation_history(),
             "plan": self.plan.snapshot(),
             "subagents": self.subagents.snapshot() if self.subagents else {
                 "active": [],
                 "history": [],
+            },
+            "skills": self.skills.snapshot() if self.skills is not None else {
+                "available": [],
+                "active": [],
+                "history": [],
+                "errors": [],
             },
             **self.state.snapshot(),
         }
@@ -283,8 +296,136 @@ class Agent:
     def plan_snapshot(self) -> JsonObject:
         return self.plan.snapshot()
 
+    def skill_snapshot(self) -> JsonObject:
+        if self.skills is None:
+            return {"available": [], "active": [], "history": [], "errors": []}
+        return self.skills.snapshot()
+
+    def set_approval_mode(self, mode: str) -> JsonObject:
+        """Change the mutation approval policy while the Agent is idle."""
+        normalized = mode.strip().lower()
+        if normalized not in {"safe", "ask", "never"}:
+            raise SessionError("approval mode must be safe, ask, or never")
+        with self._run_state_lock:
+            if self._running:
+                raise SessionError("wait for the current turn to finish")
+            changed = normalized != self.config.approval_mode
+            if changed:
+                updated = replace(self.config, approval_mode=normalized)
+                self.config = updated
+                self.tools.config = updated
+                if self.subagents is not None:
+                    self.subagents.config = updated
+        return {"mode": normalized, "changed": changed}
+
     def show_diff(self, path: str | None = None) -> JsonObject:
         return self.tools.workspace.show_diff(path)
+
+    def revert_changes(self, path: str | None = None) -> JsonObject:
+        result = self.tools.workspace.revert_changes(path)
+        reverted = result.get("reverted", [])
+        remaining = result.get("remaining", [])
+        self.state.record_revert(
+            reverted if isinstance(reverted, list) else [],
+            remaining if isinstance(remaining, list) else [],
+        )
+        return result
+
+    def undo_operation(self, operation_id: int) -> JsonObject:
+        """Undo all workspace changes produced by one completed conversation turn."""
+        result = self.tools.workspace.undo_operation(operation_id)
+        reverted = result.get("files", [])
+        remaining = result.get("remaining", [])
+        self.state.record_revert(
+            reverted if isinstance(reverted, list) else [],
+            remaining if isinstance(remaining, list) else [],
+        )
+        return result
+
+    def compact_context(self) -> JsonObject:
+        """Force one safe context compaction without discarding the UI transcript."""
+        if self.context is None:
+            return {
+                "compacted": False,
+                "reason": "empty_context",
+                "before_chars": 0,
+                "after_chars": 0,
+                "before_messages": 0,
+                "after_messages": 0,
+            }
+        before_chars = self.context.size_chars
+        before_messages = len(self.context.messages)
+        compacted = self.context.compact(force=True)
+        return {
+            "compacted": compacted,
+            "reason": "compacted" if compacted else "not_enough_history",
+            "before_chars": before_chars,
+            "after_chars": self.context.size_chars,
+            "before_messages": before_messages,
+            "after_messages": len(self.context.messages),
+        }
+
+    def recovery_snapshot(self) -> JsonObject:
+        """Describe whether the last failed turn can continue or safely restart."""
+        result = self.last_result
+        if result is None or result.success or not self.tasks:
+            return {"available": False}
+
+        operation = next(
+            (
+                item
+                for item in reversed(self.tools.workspace.operation_history())
+                if item.get("turn") == self.turns
+            ),
+            None,
+        )
+        changed_at_failure = result.state.get("changed_files", [])
+        can_retry = operation is None and not changed_at_failure
+        operation_id: int | None = None
+        blocked_reason = ""
+        if operation is not None:
+            status = operation.get("status")
+            if status == "undone":
+                can_retry = True
+            elif operation.get("can_undo") is True:
+                can_retry = True
+                raw_id = operation.get("id")
+                operation_id = raw_id if isinstance(raw_id, int) else None
+            else:
+                blocked_reason = str(
+                    operation.get("blocked_reason") or "无法安全恢复失败前的文件状态"
+                )
+        elif changed_at_failure:
+            blocked_reason = "未找到完整的失败轮次撤销点，无法保证安全重试"
+        return {
+            "available": True,
+            "turn": self.turns,
+            "task": self.tasks[-1],
+            "reason": result.reason,
+            "final": result.final,
+            "can_continue": True,
+            "can_retry": can_retry,
+            "retry_operation_id": operation_id,
+            "retry_blocked_reason": blocked_reason,
+        }
+
+    def prepare_retry(self, operation_id: int | None) -> JsonObject:
+        """Restore the failed turn checkpoint and reset its unfinished plan."""
+        recovery = self.recovery_snapshot()
+        if recovery.get("available") is not True:
+            raise SessionError("there is no failed turn to retry")
+        if recovery.get("can_retry") is not True:
+            raise SessionError(
+                str(recovery.get("retry_blocked_reason") or "this turn cannot be retried")
+            )
+        expected = recovery.get("retry_operation_id")
+        if expected is not None and operation_id != expected:
+            raise SessionError("the retry checkpoint is no longer current")
+        restored: JsonObject = {"files": [], "file_count": 0}
+        if isinstance(expected, int):
+            restored = self.undo_operation(expected)
+        self.plan.clear()
+        return restored
 
     def export_session_state(self) -> JsonObject:
         if self.context is None or self.turns <= 0:
@@ -294,10 +435,13 @@ class Agent:
             "turns": self.turns,
             "total_steps": self.total_steps,
             "conversation": self.context.export_conversation(),
+            "transcript": copy.deepcopy(self.transcript),
+            "last_result": self._saved_result(),
             "plan_state": self.plan.export_state(),
             "task_state": self.state.export_state(),
             "workspace_state": self.tools.workspace.export_diff_state(),
             "subagent_state": self.subagents.export_state() if self.subagents else None,
+            "skill_state": self.skills.export_state() if self.skills is not None else None,
         }
 
     def restore_session_state(self, payload: Any) -> list[str]:
@@ -326,6 +470,9 @@ class Agent:
             conversation,
             self.config.max_context_chars,
         )
+        restored_transcript = self._restore_transcript(
+            payload.get("transcript"), conversation, tasks, turns
+        )
         restored_plan = PlanState.restore(payload.get("plan_state"))
         restored_state = TaskState.restore(payload.get("task_state"))
         restored_workspace = Workspace(
@@ -346,20 +493,27 @@ class Agent:
         )
         if restored_subagents is not None:
             restored_subagents.restore_state(payload.get("subagent_state"))
+        if self.skills is not None:
+            try:
+                self.skills.restore_state(payload.get("skill_state"))
+            except ValueError as exc:
+                raise SessionError(f"saved skill state is invalid: {exc}") from exc
 
         self.tools = restored_tools
         self.subagents = restored_subagents
         self.plan = restored_plan
         self.context = restored_context
+        self.transcript = restored_transcript
         self.state = restored_state
         self.tasks = list(tasks)
         self.turns = turns
         self.total_steps = total_steps
-        self.last_result = None
+        self.last_result = self._restore_last_result(payload.get("last_result"))
         return drifted
 
     def run(self, task: str) -> AgentResult:
         """Run one user turn while retaining earlier messages and workspace evidence."""
+        checkpoint_started = False
         with self._run_state_lock:
             if self._running:
                 raise RuntimeError("agent is already running")
@@ -369,11 +523,24 @@ class Agent:
             if callable(reset_cancel):
                 reset_cancel()
             self._running = True
+            if self.skills is not None:
+                self.skills.begin_turn(self.turns + 1)
             if self.subagents is not None:
                 self.subagents.begin_turn()
         try:
+            if task.strip() and self._tool_scope == "full":
+                self.tools.workspace.begin_turn_operation(self.turns + 1, task)
+                checkpoint_started = True
             return self._run_turn(task)
         finally:
+            if checkpoint_started:
+                try:
+                    self.tools.workspace.finish_turn_operation()
+                except Exception as exc:
+                    self.events(
+                        "checkpoint_error",
+                        {"message": str(exc), "turn": self.turns},
+                    )
             with self._run_state_lock:
                 self._running = False
 
@@ -389,6 +556,21 @@ class Agent:
         if self.subagents is not None:
             self.subagents.cancel_active()
         return True
+
+    def record_failure(self, final: str, reason: str = "runtime_error") -> AgentResult:
+        """Turn a provider/runtime exception into a persisted recoverable result."""
+        if self.context is None or self.turns <= 0:
+            raise SessionError("there is no active conversation turn to recover")
+        message = final.strip() or "The task stopped because of a runtime error."
+        self.context.append({"role": "assistant", "content": message})
+        return self._finish(
+            False,
+            message,
+            0,
+            reason,
+            tuple(self.context.messages),
+            self._result_state(self.state),
+        )
 
     def _run_turn(self, task: str) -> AgentResult:
         if not task.strip():
@@ -415,9 +597,11 @@ class Agent:
 
         self.tasks.append(normalized_task)
         self.turns += 1
+        self.last_result = None
         context = self.context
         state = self.state
         turn = self.turns
+        self._append_transcript("user", normalized_task, turn)
         turn_start_operation = state.operation_index
         verification_pending_at_start = (
             state.verification_required and not state.verification_passed
@@ -446,6 +630,8 @@ class Agent:
                 reply.content, reply.tool_calls, reply.extensions
             )
             context.append(assistant_message)
+            if reply.content.strip():
+                self._append_transcript("assistant", reply.content.strip(), turn)
 
             if reply.content.strip():
                 self.events(
@@ -685,6 +871,7 @@ class Agent:
         result = AgentResult(success, final, steps, reason, messages, state)
         self.total_steps += steps
         self.last_result = result
+        self._append_transcript("assistant", final, self.turns)
         return result
 
     def _complete_model(
@@ -766,6 +953,7 @@ class Agent:
                 "active": [],
                 "history": [],
             },
+            "skills": self.skill_snapshot(),
         }
 
     def _build_runtime(
@@ -778,7 +966,6 @@ class Agent:
                 self.client_factory,
                 workspace,
                 event_handler=self.events,
-                approver=self.approver,
                 cancel_event=self._cancel_event,
             )
         registry = ToolRegistry(
@@ -795,8 +982,109 @@ class Agent:
                 if manager and self._parallel_delegation
                 else None
             ),
+            skill_list_handler=self.skills.list_skills if self.skills else None,
+            skill_activate_handler=self.skills.activate if self.skills else None,
+            skill_resource_handler=self.skills.read_resource if self.skills else None,
         )
         return registry, manager
+
+    def _append_transcript(self, role: str, content: str, turn: int) -> None:
+        text = content.strip()
+        if not text:
+            return
+        entry: JsonObject = {"role": role, "content": text, "turn": turn}
+        if self.transcript and self.transcript[-1] == entry:
+            return
+        self.transcript.append(entry)
+
+    def _saved_result(self) -> JsonObject | None:
+        result = self.last_result
+        if result is None:
+            return None
+        return {
+            "success": result.success,
+            "final": result.final,
+            "steps": result.steps,
+            "reason": result.reason,
+        }
+
+    def _restore_last_result(self, payload: Any) -> AgentResult | None:
+        if payload is None:
+            return None
+        if not isinstance(payload, dict):
+            raise SessionError("saved last result must be an object")
+        success = payload.get("success")
+        final = payload.get("final")
+        reason = payload.get("reason")
+        steps = payload.get("steps")
+        if (
+            not isinstance(success, bool)
+            or not isinstance(final, str)
+            or not isinstance(reason, str)
+            or not isinstance(steps, int)
+            or isinstance(steps, bool)
+            or steps < 0
+        ):
+            raise SessionError("saved last result is invalid")
+        return AgentResult(
+            success,
+            final,
+            steps,
+            reason,
+            self.messages,
+            self._result_state(self.state),
+        )
+
+    @staticmethod
+    def _restore_transcript(
+        payload: Any,
+        conversation: list[Message],
+        tasks: list[str],
+        turns: int,
+    ) -> list[JsonObject]:
+        if payload is None:
+            visible: list[JsonObject] = []
+            task_index = 0
+            turn = 0
+            for message in conversation:
+                if not isinstance(message, dict):
+                    continue
+                role = message.get("role")
+                content = message.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    continue
+                if role == "user":
+                    if task_index >= len(tasks) or content != tasks[task_index]:
+                        continue
+                    task_index += 1
+                    turn = task_index
+                    visible.append({"role": "user", "content": content, "turn": turn})
+                elif role == "assistant" and turn > 0:
+                    visible.append(
+                        {"role": "assistant", "content": content, "turn": turn}
+                    )
+            return visible
+
+        if not isinstance(payload, list) or len(payload) > 100_000:
+            raise SessionError("saved transcript must be a bounded list")
+        restored: list[JsonObject] = []
+        for index, entry in enumerate(payload):
+            if not isinstance(entry, dict):
+                raise SessionError(f"saved transcript entry {index + 1} is invalid")
+            role = entry.get("role")
+            content = entry.get("content")
+            turn = entry.get("turn")
+            if (
+                role not in {"user", "assistant"}
+                or not isinstance(content, str)
+                or not content.strip()
+                or not isinstance(turn, int)
+                or isinstance(turn, bool)
+                or not 1 <= turn <= turns
+            ):
+                raise SessionError(f"saved transcript entry {index + 1} is invalid")
+            restored.append({"role": role, "content": content, "turn": turn})
+        return restored
 
     @staticmethod
     def _cancelled_tool_payload(name: str, *, skipped: bool = False) -> str:

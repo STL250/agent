@@ -18,6 +18,7 @@ const ui = {
   newSession: $("#newSessionButton"),
   sessions: $("#sessionList"),
   sessionCount: $("#sessionCount"),
+  sessionSearch: $("#sessionSearchInput"),
   workspaceName: $("#workspaceName"),
   workspacePath: $("#workspacePath"),
   modelName: $("#modelName"),
@@ -27,12 +28,25 @@ const ui = {
   pageMeta: $("#pageMeta"),
   runStatus: $("#runStatus"),
   runStatusText: $("#runStatusText"),
+  approvalModeControl: $("#approvalModeControl"),
+  approvalModeTrigger: $("#approvalModeTrigger"),
+  approvalModeLabel: $("#approvalModeLabel"),
+  approvalModeMenu: $("#approvalModeMenu"),
+  compactButton: $("#compactContextButton"),
+  compactUsage: $("#compactContextUsage"),
+  compactModal: $("#compactContextModal"),
+  compactUsageValue: $("#compactUsageValue"),
+  compactUsageBar: $("#compactUsageBar"),
+  compactUsageDetail: $("#compactUsageDetail"),
+  confirmCompact: $("#confirmCompactButton"),
   turnSummary: $("#turnSummary"),
   planEmpty: $("#planEmpty"),
   planList: $("#planList"),
   inspectedCount: $("#inspectedCount"),
   changedCount: $("#changedCount"),
-  changedFiles: $("#changedFiles"),
+  projectFiles: $("#projectFileList"),
+  fileSearch: $("#fileSearchInput"),
+  fileListNote: $("#fileListNote"),
   verificationCard: $("#verificationCard"),
   verificationTitle: $("#verificationTitle"),
   verificationDetail: $("#verificationDetail"),
@@ -40,6 +54,9 @@ const ui = {
   subagentSection: $("#subagentSection"),
   subagentCount: $("#subagentCount"),
   subagentList: $("#subagentList"),
+  skillSection: $("#skillSection"),
+  skillCount: $("#skillCount"),
+  skillList: $("#skillList"),
   approvalModal: $("#approvalModal"),
   approvalTool: $("#approvalTool"),
   approvalSummary: $("#approvalSummary"),
@@ -52,6 +69,19 @@ const ui = {
   diffFileList: $("#diffFileList"),
   diffActivePath: $("#diffActivePath"),
   diffSummary: $("#diffSummary"),
+  fileModal: $("#fileModal"),
+  filePreviewTitle: $("#filePreviewTitle"),
+  filePreviewMeta: $("#filePreviewMeta"),
+  filePreviewContent: $("#filePreviewContent"),
+  fileDiff: $("#fileDiffButton"),
+  commandList: $("#commandList"),
+  commandCount: $("#commandCount"),
+  commandSummary: $("#commandSummary"),
+  renameModal: $("#renameModal"),
+  renameInput: $("#renameSessionInput"),
+  confirmModal: $("#confirmModal"),
+  confirmTitle: $("#confirmTitle"),
+  confirmMessage: $("#confirmMessage"),
   toasts: $("#toastRegion"),
 };
 
@@ -69,6 +99,21 @@ let activeDiffIndex = -1;
 let currentDiffTruncated = false;
 let followLatestMessage = true;
 const subagentState = new Map();
+const skillState = new Map();
+let allSessions = [];
+let workspaceFiles = [];
+let changedFileSet = new Set();
+let hiddenWorkspaceFiles = 0;
+let workspaceFilesTruncated = false;
+const collapsedFolders = new Set();
+const workspaceTreeCollator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
+let activePreviewPath = null;
+let pendingRenameSession = null;
+let pendingConfirmAction = null;
+let liveTurnNumber = 0;
+let activeRecovery = null;
+let compacting = false;
+let approvalChanging = false;
 
 async function request(path, options = {}) {
   const headers = new Headers(options.headers || {});
@@ -102,6 +147,10 @@ function setBusy(value, label = "就绪") {
   ui.send.classList.toggle("stop", value);
   ui.send.setAttribute("aria-label", value ? "停止当前任务" : "发送消息");
   ui.newSession.disabled = value;
+  ui.approvalModeTrigger.disabled = value || approvalChanging;
+  if (value) setApprovalMenu(false);
+  ui.compactButton.disabled = value || !contextCanCompact();
+  $$(".recovery-actions button").forEach((button) => { button.disabled = value || button.dataset.blocked === "true"; });
   ui.input.disabled = value;
   ui.runStatus.className = `run-status ${value ? "working" : "idle"}`;
   ui.runStatusText.textContent = value ? label : "就绪";
@@ -119,11 +168,37 @@ function setRunError(message) {
   ui.send.classList.remove("stop");
   ui.send.setAttribute("aria-label", "发送消息");
   ui.newSession.disabled = false;
+  ui.approvalModeTrigger.disabled = approvalChanging;
+  ui.compactButton.disabled = !contextCanCompact();
   ui.input.disabled = false;
   ui.runStatus.className = "run-status error";
   ui.runStatusText.textContent = "已停止";
   clearThinking();
   toast(message, "error");
+}
+
+function contextCanCompact() {
+  const status = currentSnapshot && currentSnapshot.status || {};
+  return Number(status.turns || 0) > 0 && Number(status.messages || 0) > 3;
+}
+
+function approvalModeLabel(mode) {
+  return { safe: "安全", ask: "每次确认", never: "只读" }[mode] || mode || "安全";
+}
+
+function approvalModeControlLabel(mode) {
+  return { safe: "安全模式", ask: "每次确认", never: "只读模式" }[mode] || "安全模式";
+}
+
+function setApprovalMenu(open) {
+  const shouldOpen = Boolean(open) && !busy && !approvalChanging;
+  ui.approvalModeMenu.hidden = !shouldOpen;
+  ui.approvalModeTrigger.setAttribute("aria-expanded", String(shouldOpen));
+  ui.approvalModeControl.classList.toggle("open", shouldOpen);
+  if (shouldOpen) {
+    const activeOption = ui.approvalModeMenu.querySelector('[aria-checked="true"]');
+    window.requestAnimationFrame(() => activeOption && activeOption.focus());
+  }
 }
 
 function toast(message, kind = "info") {
@@ -364,11 +439,12 @@ function flushAssistantRender(message) {
   renderMarkdown(message.body, message.raw);
 }
 
-function addMessage(role, text, { streaming = false } = {}) {
+function addMessage(role, text, { streaming = false, turn = null } = {}) {
   if (role === "assistant") clearThinking();
   showConversation();
   const article = document.createElement("article");
   article.className = `message ${role}${streaming ? " streaming" : ""}`;
+  if (Number.isInteger(turn) && turn > 0) article.dataset.turn = String(turn);
 
   const avatar = document.createElement("div");
   avatar.className = "message-avatar";
@@ -434,6 +510,9 @@ function toolLabel(name) {
     run_command: "运行命令",
     delegate_task: "委派子 Agent",
     delegate_readonly_tasks: "并行委派",
+    list_skills: "浏览 Skills",
+    activate_skill: "激活 Skill",
+    read_skill_resource: "读取 Skill 资源",
   };
   return labels[name] || name;
 }
@@ -507,15 +586,111 @@ function renderSnapshot(snapshot, { renderMessages = false } = {}) {
   ui.modelProtocol.textContent = protocolLabel(config.protocol);
   ui.connectionDot.classList.add("online");
   const activeSession = (snapshot.sessions || []).find((session) => session.session_id === snapshot.session_id);
-  ui.pageTitle.textContent = activeSession ? activeSession.task_preview || "未命名会话" : "新会话";
-  ui.pageTitle.title = activeSession ? activeSession.task_preview || "未命名会话" : "新会话";
-  ui.pageMeta.textContent = `${config.workspace_name || "Workspace"} · ${config.approval || "safe"} 模式`;
+  ui.pageTitle.textContent = activeSession ? activeSession.title || activeSession.task_preview || "未命名会话" : "新会话";
+  ui.pageTitle.title = ui.pageTitle.textContent;
+  const approvalMode = config.approval || "safe";
+  ui.pageMeta.textContent = `${config.workspace_name || "Workspace"} · ${approvalModeLabel(approvalMode)}模式`;
+  ui.approvalModeLabel.textContent = approvalModeControlLabel(approvalMode);
+  ui.approvalModeControl.dataset.mode = approvalMode;
+  ui.approvalModeTrigger.title = {
+    safe: "安全模式：普通修改自动执行，敏感命令需要确认",
+    ask: "每次确认：所有文件修改和命令都需要确认",
+    never: "只读模式：禁止文件修改和命令执行",
+  }[approvalMode] || "切换审批模式";
+  $$(".approval-mode-option").forEach((option) => {
+    const selected = option.dataset.approvalMode === approvalMode;
+    option.classList.toggle("selected", selected);
+    option.setAttribute("aria-checked", String(selected));
+  });
   ui.turnSummary.textContent = `${status.turns || 0} 轮 · ${status.total_steps || 0} 个步骤`;
   renderPlan(snapshot.plan || status.plan || {});
   renderChanges(status, snapshot.diff || {});
+  renderRuntime(config, status);
+  renderCommands(status.commands || []);
   renderSubagentSnapshot(status.subagents || {});
+  renderSkillSnapshot(status.skills || {});
   renderSessions(snapshot.sessions || [], snapshot.session_id);
+  loadWorkspaceFiles();
   if (renderMessages) renderConversation(snapshot.conversation || []);
+  renderUndoActions(status.operations || []);
+  renderRecovery(status.recovery || {});
+}
+
+function renderRuntime(config, status) {
+  $("#runtimeTurns").textContent = String(status.turns || 0);
+  $("#runtimeSteps").textContent = String(status.total_steps || 0);
+  const used = Number(status.context_chars || 0);
+  const limit = Number(config.max_context_chars || 0);
+  const percent = limit ? Math.min(100, Math.round((used / limit) * 100)) : 0;
+  $("#runtimeContext").textContent = `${percent}%`;
+  ui.compactUsage.textContent = `${percent}%`;
+  ui.compactUsageValue.textContent = `${percent}%`;
+  ui.compactUsageBar.style.width = `${percent}%`;
+  ui.compactUsageDetail.textContent = `${used.toLocaleString("zh-CN")} / ${limit.toLocaleString("zh-CN")} 字符`;
+  ui.compactButton.disabled = busy || !contextCanCompact();
+  const subagents = status.subagents || {};
+  const active = Array.isArray(subagents.active) ? subagents.active.length : 0;
+  const history = Array.isArray(subagents.history) ? subagents.history.length : 0;
+  $("#runtimeSubagents").textContent = String(active + history);
+  const skills = status.skills || {};
+  $("#runtimeSkills").textContent = String(
+    Array.isArray(skills.available) ? skills.available.length : 0,
+  );
+  $("#runtimeModel").textContent = config.model || "—";
+  $("#runtimeApproval").textContent = config.approval === "safe" ? "安全确认" : config.approval || "—";
+  $("#runtimeTracking").textContent = status.workspace_tracking_complete === false ? "部分" : "完整";
+  $("#runtimeTracking").classList.toggle("warning-text", status.workspace_tracking_complete === false);
+  $("#runtimeBudget").textContent = `${config.max_steps || 0} 步`;
+}
+
+function formatDuration(milliseconds) {
+  const value = Number(milliseconds);
+  if (!Number.isFinite(value)) return "—";
+  return value < 1000 ? `${value} ms` : `${(value / 1000).toFixed(value < 10000 ? 1 : 0)} s`;
+}
+
+function renderCommands(commands) {
+  const items = Array.isArray(commands) ? [...commands].reverse() : [];
+  ui.commandCount.textContent = String(items.length);
+  const successful = items.filter((item) => item.exit_code === 0 && !item.timed_out && !item.cancelled).length;
+  ui.commandSummary.textContent = items.length ? `${successful} 次成功 · ${items.length - successful} 次未通过` : "尚未执行命令";
+  ui.commandList.replaceChildren();
+  if (!items.length) {
+    const empty = document.createElement("div");
+    empty.className = "panel-empty compact";
+    empty.innerHTML = "<strong>暂无运行记录</strong><span>Agent 执行的检查和命令输出会显示在这里。</span>";
+    ui.commandList.append(empty);
+    return;
+  }
+  for (const command of items) {
+    const success = command.exit_code === 0 && !command.timed_out && !command.cancelled;
+    const card = document.createElement("article");
+    card.className = `command-card ${success ? "success" : "failed"}`;
+    const header = document.createElement("div");
+    header.className = "command-card-header";
+    const label = document.createElement("span");
+    label.textContent = command.verification ? "验证" : "命令";
+    const result = document.createElement("strong");
+    result.textContent = command.cancelled ? "已取消" : command.timed_out ? "超时" : success ? "通过" : `退出 ${command.exit_code ?? "—"}`;
+    header.append(label, result);
+    const code = document.createElement("code");
+    code.textContent = command.command || "";
+    const meta = document.createElement("div");
+    meta.className = "command-card-meta";
+    meta.textContent = `${formatDuration(command.duration_ms)} · ${command.file_change_count || 0} 个文件变更`;
+    const outputText = [command.stdout, command.stderr].filter(Boolean).join("\n").trim();
+    card.append(header, code, meta);
+    if (outputText) {
+      const details = document.createElement("details");
+      const summary = document.createElement("summary");
+      summary.textContent = "查看输出";
+      const output = document.createElement("pre");
+      output.textContent = outputText;
+      details.append(summary, output);
+      card.append(details);
+    }
+    ui.commandList.append(card);
+  }
 }
 
 function renderSubagentSnapshot(snapshot) {
@@ -526,6 +701,53 @@ function renderSubagentSnapshot(snapshot) {
     if (item && item.agent_id) subagentState.set(item.agent_id, item);
   }
   renderSubagents();
+}
+
+function renderSkillSnapshot(snapshot) {
+  skillState.clear();
+  const available = Array.isArray(snapshot.available) ? snapshot.available : [];
+  for (const item of available) {
+    if (item && item.name) skillState.set(item.name, item);
+  }
+  renderSkills();
+}
+
+function updateSkill(data) {
+  if (!data || !data.name) return;
+  const previous = skillState.get(data.name) || {};
+  skillState.set(data.name, {
+    ...previous,
+    ...data,
+    active: true,
+    used_count: Math.max(1, Number(previous.used_count || 0) + (previous.active ? 0 : 1)),
+  });
+  renderSkills();
+}
+
+function renderSkills() {
+  const items = [...skillState.values()];
+  ui.skillSection.hidden = items.length === 0;
+  ui.skillCount.textContent = String(items.length);
+  ui.skillList.replaceChildren();
+  for (const item of items) {
+    const card = document.createElement("article");
+    card.className = `skill-card ${item.active ? "active" : item.used_count ? "used" : ""}`;
+    const header = document.createElement("div");
+    header.className = "skill-card-header";
+    const title = document.createElement("strong");
+    title.textContent = item.name || "skill";
+    const badge = document.createElement("span");
+    badge.textContent = item.active ? "已激活" : item.used_count ? "已使用" : "可用";
+    header.append(title, badge);
+    const description = document.createElement("p");
+    description.textContent = item.description || "可复用任务工作流";
+    const meta = document.createElement("div");
+    meta.className = "skill-card-meta";
+    const resources = Number(item.resources || 0);
+    meta.textContent = `${item.source || "本地"}${resources ? ` · ${resources} 个资源` : ""}`;
+    card.append(header, description, meta);
+    ui.skillList.append(card);
+  }
 }
 
 function updateSubagent(data) {
@@ -540,7 +762,7 @@ function renderSubagents() {
   ui.subagentSection.hidden = items.length === 0;
   ui.subagentCount.textContent = String(items.length);
   ui.subagentList.replaceChildren();
-  const modeNames = { explore: "探索", implement: "实现", review: "审查" };
+  const modeNames = { explore: "探索", review: "审查" };
   const statusNames = {
     running: "执行中",
     completed: "已完成",
@@ -590,8 +812,11 @@ function renderConversation(messages) {
     return;
   }
   ui.empty.classList.add("hidden");
+  let inferredTurn = 0;
   for (const message of messages) {
-    addMessage(message.role === "assistant" ? "assistant" : "user", message.content || "");
+    if (message.role !== "assistant") inferredTurn += 1;
+    const turn = Number.isInteger(message.turn) && message.turn > 0 ? message.turn : inferredTurn;
+    addMessage(message.role === "assistant" ? "assistant" : "user", message.content || "", { turn });
     if (message.role === "assistant") lastAssistantText = message.content || "";
   }
   window.requestAnimationFrame(() => scrollToBottom({ force: true }));
@@ -599,6 +824,8 @@ function renderConversation(messages) {
 
 function renderPlan(plan) {
   const steps = Array.isArray(plan.steps) ? plan.steps : [];
+  const completed = steps.filter((step) => step.status === "completed").length;
+  $("#planProgress").textContent = `${completed} / ${steps.length}`;
   ui.planList.replaceChildren();
   ui.planEmpty.hidden = steps.length > 0;
   ui.planList.hidden = steps.length === 0;
@@ -631,59 +858,268 @@ function renderChanges(status, diff) {
   const changed = Array.isArray(status.changed_files) ? status.changed_files : [];
   ui.inspectedCount.textContent = String(inspected.length);
   ui.changedCount.textContent = String(changed.length);
-  ui.changedFiles.replaceChildren();
-  for (const path of changed) {
-    const row = document.createElement("div");
-    row.className = "file-row";
-    const name = document.createElement("span");
-    name.textContent = path;
-    name.title = path;
-    row.append(name);
-    ui.changedFiles.append(row);
-  }
+  changedFileSet = new Set(changed);
   ui.verificationCard.className = "verification-card neutral";
   if (!status.verification_required) {
     ui.verificationTitle.textContent = "无需验证";
     ui.verificationDetail.textContent = changed.length ? "当前状态不需要额外检查" : "还没有文件修改";
-    ui.verificationCard.querySelector(".verification-icon").textContent = "·";
   } else if (status.verification_passed) {
-    ui.verificationCard.classList.add("passed");
+    ui.verificationCard.className = "verification-card passed";
     ui.verificationTitle.textContent = "验证通过";
     ui.verificationDetail.textContent = "最新修改之后的检查已成功";
-    ui.verificationCard.querySelector(".verification-icon").textContent = "✓";
   } else {
-    ui.verificationCard.classList.add("pending");
+    ui.verificationCard.className = "verification-card pending";
     ui.verificationTitle.textContent = "等待验证";
     ui.verificationDetail.textContent = "修改完成后需要运行检查";
-    ui.verificationCard.querySelector(".verification-icon").textContent = "!";
   }
   if (diff && diff.truncated) toast("Diff 内容较长，界面仅显示截断结果", "warning");
 }
 
 function renderSessions(sessions, activeId) {
+  allSessions = Array.isArray(sessions) ? sessions : [];
+  renderSessionList(activeId);
+}
+
+function renderSessionList(activeId = currentSnapshot && currentSnapshot.session_id) {
   ui.sessions.replaceChildren();
-  ui.sessionCount.textContent = String(sessions.length);
-  if (!sessions.length) {
+  const query = ui.sessionSearch.value.trim().toLocaleLowerCase();
+  const sessions = allSessions.filter((session) => {
+    const text = `${session.title || ""} ${session.task_preview || ""}`.toLocaleLowerCase();
+    return !query || text.includes(query);
+  });
+  ui.sessionCount.textContent = query ? `${sessions.length}/${allSessions.length}` : String(allSessions.length);
+  if (!allSessions.length) {
     const empty = document.createElement("div");
     empty.className = "session-empty";
     empty.textContent = "完成第一个任务后，会话会自动保存在这里。";
     ui.sessions.append(empty);
     return;
   }
+  if (!sessions.length) {
+    const empty = document.createElement("div");
+    empty.className = "session-empty";
+    empty.textContent = "没有匹配的会话。";
+    ui.sessions.append(empty);
+    return;
+  }
   sessions.forEach((session) => {
+    const row = document.createElement("div");
+    row.className = `session-entry${session.session_id === activeId ? " active" : ""}`;
+    row.dataset.pinned = String(Boolean(session.pinned));
     const button = document.createElement("button");
     button.type = "button";
-    button.className = `session-item${session.session_id === activeId ? " active" : ""}`;
+    button.className = "session-item";
     button.dataset.sessionId = session.session_id;
-    button.title = `${session.task_preview || "未命名会话"} · ${session.turns} 轮 · ${session.total_steps} 步`;
-    const title = document.createElement("strong");
-    title.textContent = session.task_preview || "未命名会话";
-    const meta = document.createElement("span");
-    meta.textContent = `${session.turns} 轮 · ${session.total_steps} 步`;
-    button.append(title, meta);
+    button.title = `${session.title || session.task_preview || "未命名会话"} · ${session.turns} 轮 · ${session.total_steps} 步`;
+    const title = document.createElement("span");
+    title.className = "session-title";
+    title.textContent = session.title || session.task_preview || "未命名会话";
+    button.append(title);
     button.addEventListener("click", () => resumeSession(session.session_id));
-    ui.sessions.append(button);
+    const actions = document.createElement("div");
+    actions.className = "session-actions";
+    const pin = document.createElement("button");
+    pin.type = "button";
+    pin.className = "session-pin-button";
+    pin.setAttribute("aria-label", session.pinned ? `取消固定 ${title.textContent}` : `固定 ${title.textContent}`);
+    pin.title = session.pinned ? "取消固定" : "固定";
+    pin.innerHTML = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 17v5M5 17h14M15 3.5a4 4 0 0 1 0 7l-1 6h-4l-1-6a4 4 0 0 1 0-7Z"/></svg>';
+    pin.addEventListener("click", (event) => {
+      event.stopPropagation();
+      pinSession(session.session_id, !session.pinned);
+    });
+    const trigger = document.createElement("button");
+    trigger.type = "button";
+    trigger.className = "session-menu-trigger";
+    trigger.setAttribute("aria-label", `管理 ${title.textContent}`);
+    trigger.title = "更多";
+    trigger.innerHTML = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/></svg>';
+    const menu = document.createElement("div");
+    menu.className = "session-menu";
+    const menuItems = [
+      [session.pinned ? "取消固定" : "固定", () => pinSession(session.session_id, !session.pinned)],
+      ["重命名", () => openRenameSession(session)],
+      ["导出 Markdown", () => exportSession(session.session_id)],
+      ["删除", () => confirmDeleteSession(session)],
+    ];
+    for (const [label, action] of menuItems) {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.textContent = label;
+      if (label === "删除") item.className = "danger-text";
+      item.addEventListener("click", (event) => {
+        event.stopPropagation();
+        menu.classList.remove("open");
+        action();
+      });
+      menu.append(item);
+    }
+    trigger.addEventListener("click", (event) => {
+      event.stopPropagation();
+      $$(".session-menu.open").forEach((item) => { if (item !== menu) item.classList.remove("open"); });
+      menu.classList.toggle("open");
+    });
+    actions.append(pin, trigger, menu);
+    row.append(button, actions);
+    ui.sessions.append(row);
   });
+}
+
+async function loadWorkspaceFiles() {
+  try {
+    const payload = await jsonRequest("/api/files");
+    workspaceFiles = Array.isArray(payload.entries) ? payload.entries : [];
+    changedFileSet = new Set(Array.isArray(payload.changed_files) ? payload.changed_files : []);
+    hiddenWorkspaceFiles = Number(payload.hidden_files || 0);
+    workspaceFilesTruncated = Boolean(payload.truncated);
+    renderWorkspaceFiles();
+  } catch (error) {
+    ui.projectFiles.textContent = error.message;
+  }
+}
+
+function buildWorkspaceTree(entries) {
+  const root = { children: new Map() };
+  for (const rawPath of entries) {
+    const explicitFolder = rawPath.endsWith("/");
+    const cleanPath = explicitFolder ? rawPath.slice(0, -1) : rawPath;
+    const parts = cleanPath.split("/").filter(Boolean);
+    let parent = root;
+    for (let index = 0; index < parts.length; index += 1) {
+      const name = parts[index];
+      const folder = index < parts.length - 1 || explicitFolder;
+      const path = parts.slice(0, index + 1).join("/") + (folder ? "/" : "");
+      let node = parent.children.get(name);
+      if (!node) {
+        node = { name, path, folder, children: new Map(), changed: false, visible: true, selfMatches: true };
+        parent.children.set(name, node);
+      } else if (folder) {
+        node.folder = true;
+        node.path = path;
+      }
+      parent = node;
+    }
+  }
+  return root;
+}
+
+function prepareWorkspaceTree(node, query) {
+  let descendantMatches = false;
+  let descendantChanged = false;
+  for (const child of node.children.values()) {
+    prepareWorkspaceTree(child, query);
+    descendantMatches ||= child.visible;
+    descendantChanged ||= child.changed;
+  }
+  if (!node.name) return;
+  node.selfMatches = !query || node.path.toLocaleLowerCase().includes(query);
+  node.visible = !query || node.selfMatches || descendantMatches;
+  node.changed = changedFileSet.has(node.path) || descendantChanged;
+}
+
+function sortedWorkspaceNodes(children) {
+  return [...children.values()].sort((left, right) => {
+    if (left.folder !== right.folder) return left.folder ? -1 : 1;
+    return workspaceTreeCollator.compare(left.name, right.name);
+  });
+}
+
+function renderWorkspaceFiles() {
+  const query = ui.fileSearch.value.trim().toLocaleLowerCase();
+  const tree = buildWorkspaceTree(workspaceFiles);
+  prepareWorkspaceTree(tree, query);
+  ui.projectFiles.replaceChildren();
+  const hasMatches = sortedWorkspaceNodes(tree.children).some((node) => node.visible);
+  if (!hasMatches) {
+    const empty = document.createElement("div");
+    empty.className = "panel-empty compact";
+    const strong = document.createElement("strong");
+    strong.textContent = query ? "没有匹配文件" : "项目中没有可预览文件";
+    const detail = document.createElement("span");
+    detail.textContent = query ? "尝试缩短筛选关键词。" : "空目录和忽略目录不会显示。";
+    empty.append(strong, detail);
+    ui.projectFiles.append(empty);
+  }
+  let visibleCount = 0;
+  const appendNodes = (children, depth, ancestorMatches = false) => {
+    for (const node of sortedWorkspaceNodes(children)) {
+      if (query && !ancestorMatches && !node.visible) continue;
+      visibleCount += 1;
+      const collapsed = node.folder && collapsedFolders.has(node.path) && !query;
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = `project-file-row ${node.folder ? "folder" : "file"}${node.changed ? " changed" : ""}`;
+      row.style.setProperty("--file-depth", String(depth));
+      row.title = node.path;
+
+      const chevron = document.createElement("span");
+      chevron.className = `project-file-chevron${collapsed ? " collapsed" : ""}`;
+      if (node.folder) {
+        chevron.innerHTML = '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="m5.5 3.5 4 4-4 4"/></svg>';
+        row.setAttribute("aria-expanded", String(!collapsed));
+      }
+      const icon = document.createElement("span");
+      icon.className = "project-file-icon";
+      icon.innerHTML = node.folder
+        ? '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M3.5 7V5.5a2 2 0 0 1 2-2H10l2 2h6.5a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2Z"/></svg>'
+        : '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 3.5h8l4 4v13H6z"/><path d="M14 3.5v4h4"/></svg>';
+      const name = document.createElement("span");
+      name.className = "project-file-name";
+      name.textContent = node.name;
+      row.append(chevron, icon, name);
+
+      if (node.folder) {
+        row.addEventListener("click", () => {
+          if (collapsedFolders.has(node.path)) collapsedFolders.delete(node.path);
+          else collapsedFolders.add(node.path);
+          renderWorkspaceFiles();
+        });
+      } else {
+        if (changedFileSet.has(node.path)) {
+          const badge = document.createElement("small");
+          badge.textContent = "M";
+          row.append(badge);
+        }
+        row.addEventListener("click", () => openFilePreview(node.path));
+      }
+      ui.projectFiles.append(row);
+      if (node.folder && !collapsed) {
+        appendNodes(node.children, depth + 1, ancestorMatches || node.selfMatches);
+      }
+    }
+  };
+  appendNodes(tree.children, 0);
+  ui.fileListNote.textContent = `${visibleCount} / ${workspaceFiles.length} 项${workspaceFilesTruncated ? " · 列表已截断" : ""}${hiddenWorkspaceFiles ? ` · ${hiddenWorkspaceFiles} 个敏感改动已隐藏` : ""}`;
+}
+
+async function openFilePreview(path) {
+  activePreviewPath = path;
+  ui.fileModal.hidden = false;
+  ui.filePreviewTitle.textContent = path;
+  ui.filePreviewMeta.textContent = "正在读取…";
+  ui.filePreviewContent.textContent = "正在读取…";
+  ui.fileDiff.hidden = true;
+  try {
+    const file = await jsonRequest(`/api/file?path=${encodeURIComponent(path)}`);
+    ui.filePreviewTitle.textContent = file.path;
+    ui.filePreviewMeta.textContent = `${file.lines} 行 · ${formatBytes(file.size)}${file.truncated ? " · 预览已截断" : ""}`;
+    const pre = document.createElement("pre");
+    const code = document.createElement("code");
+    code.textContent = file.content || "（空文件）";
+    pre.append(code);
+    ui.filePreviewContent.replaceChildren(pre);
+    ui.fileDiff.hidden = !file.changed;
+  } catch (error) {
+    ui.filePreviewMeta.textContent = "无法预览";
+    ui.filePreviewContent.textContent = error.message;
+  }
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes) || 0;
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function switchTab(name) {
@@ -701,6 +1137,31 @@ function openApproval(data) {
   ui.approvalSummary.textContent = data.summary || "该操作会修改本地状态。";
   ui.approvalModal.hidden = false;
   ui.reject.focus();
+}
+
+async function changeApprovalMode(nextMode) {
+  if (busy || approvalChanging) return;
+  const currentMode = currentSnapshot && currentSnapshot.config
+    ? currentSnapshot.config.approval || "safe"
+    : "safe";
+  setApprovalMenu(false);
+  if (nextMode === currentMode) return;
+  approvalChanging = true;
+  ui.approvalModeTrigger.disabled = true;
+  try {
+    const snapshot = await jsonRequest("/api/settings/approval", {
+      method: "POST",
+      body: JSON.stringify({ mode: nextMode }),
+    });
+    renderSnapshot(snapshot);
+    toast(`已切换为${approvalModeLabel(nextMode)}模式`, "success");
+    addActivity("审批模式已切换", `${approvalModeLabel(currentMode)} → ${approvalModeLabel(nextMode)}`, "warning");
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    approvalChanging = false;
+    ui.approvalModeTrigger.disabled = busy;
+  }
 }
 
 async function answerApproval(approved) {
@@ -731,10 +1192,10 @@ function handleEvent(event, data) {
       break;
     case "assistant_stream_start":
       clearThinking();
-      activeAssistant = addMessage("assistant", "", { streaming: true });
+      activeAssistant = addMessage("assistant", "", { streaming: true, turn: data.turn || liveTurnNumber });
       break;
     case "assistant_text_delta":
-      if (!activeAssistant) activeAssistant = addMessage("assistant", "", { streaming: true });
+      if (!activeAssistant) activeAssistant = addMessage("assistant", "", { streaming: true, turn: data.turn || liveTurnNumber });
       activeAssistant.raw += data.text || "";
       lastAssistantText = activeAssistant.raw;
       queueAssistantRender(activeAssistant);
@@ -749,7 +1210,7 @@ function handleEvent(event, data) {
     case "assistant_text":
       clearThinking();
       if (!data.streamed && data.text) {
-        addMessage("assistant", data.text);
+        addMessage("assistant", data.text, { turn: data.turn || liveTurnNumber });
         lastAssistantText = data.text;
       }
       break;
@@ -774,6 +1235,13 @@ function handleEvent(event, data) {
         data.status === "completed" ? "success" : "error",
       );
       break;
+    case "skill_activated":
+      updateSkill(data);
+      addActivity("Skill 已激活", `${data.name || "skill"} · ${data.source || "本地"}`, "skill");
+      break;
+    case "skill_resource_read":
+      addActivity("读取 Skill 资源", `${data.name || "skill"} · ${data.path || ""}`, "skill");
+      break;
     case "plan_updated":
       renderPlan(data);
       addActivity("计划已更新", `${(data.steps || []).length} 个步骤`, "success");
@@ -781,6 +1249,15 @@ function handleEvent(event, data) {
     case "context_compacted":
       addSystemNote(`上下文已压缩为 ${data.messages} 条消息`);
       addActivity("上下文压缩", `保留 ${data.messages} 条消息`);
+      break;
+    case "recovery_started":
+      addActivity(
+        data.mode === "retry" ? "正在恢复并重试" : "正在继续任务",
+        data.mode === "retry" && (data.restored_files || []).length
+          ? `已恢复 ${(data.restored_files || []).length} 个文件`
+          : "沿用当前工作区状态",
+        "warning",
+      );
       break;
     case "verification_required":
       addSystemNote("文件已修改，Rivet 正在执行必要的验证");
@@ -798,6 +1275,9 @@ function handleEvent(event, data) {
       break;
     case "session_error":
       toast(data.message || "会话保存失败", "error");
+      break;
+    case "checkpoint_error":
+      toast("任务已完成，但本轮修改无法创建安全撤销点", "warning");
       break;
     case "cancelled":
       clearThinking();
@@ -827,10 +1307,15 @@ function handleRecord(record) {
     setRunError(record.message || "任务执行失败");
     return;
   }
+  if (record.type === "recovery_error") {
+    if (record.snapshot) renderSnapshot(record.snapshot);
+    setRunError(record.message || "无法恢复这项任务");
+    return;
+  }
   if (record.type === "turn_complete") {
     const result = record.result || {};
     if (result.final && result.final.trim() !== lastAssistantText.trim()) {
-      addMessage("assistant", result.final);
+      addMessage("assistant", result.final, { turn: liveTurnNumber });
       lastAssistantText = result.final;
     }
     if (record.snapshot) renderSnapshot(record.snapshot);
@@ -842,13 +1327,35 @@ function handleRecord(record) {
   }
 }
 
+async function consumeTurnResponse(response) {
+  if (!response.body) throw new Error("浏览器不支持流式响应");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      handleRecord(JSON.parse(line));
+    }
+    if (done) break;
+  }
+  if (buffer.trim()) handleRecord(JSON.parse(buffer));
+}
+
 async function sendTurn(message) {
   const task = message.trim();
   if (!task || busy) return;
   followLatestMessage = true;
-  addMessage("user", task);
+  liveTurnNumber = Number(currentSnapshot && currentSnapshot.status && currentSnapshot.status.turns || 0) + 1;
+  addMessage("user", task, { turn: liveTurnNumber });
   lastAssistantText = "";
   activeAssistant = null;
+  activeRecovery = null;
+  $$(".recovery-card").forEach((item) => item.remove());
   ui.input.value = "";
   resizeComposer();
   setBusy(true, "正在开始");
@@ -857,24 +1364,42 @@ async function sendTurn(message) {
       method: "POST",
       body: JSON.stringify({ message: task }),
     });
-    if (!response.body) throw new Error("浏览器不支持流式响应");
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    while (true) {
-      const { value, done } = await reader.read();
-      buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        handleRecord(JSON.parse(line));
-      }
-      if (done) break;
-    }
-    if (buffer.trim()) handleRecord(JSON.parse(buffer));
+    await consumeTurnResponse(response);
   } catch (error) {
     setRunError(error.message || "无法完成任务");
+  } finally {
+    if (busy) setBusy(false);
+  }
+}
+
+function recoveryPrompt(mode, recovery) {
+  const task = String(recovery && recovery.task || "").trim();
+  if (mode === "retry") {
+    return `重新尝试上一轮任务：“${task}”。失败轮次产生的文件修改已安全恢复；请重新分析，完成任务并验证结果。`;
+  }
+  return `继续完成上一轮未完成的任务：“${task}”。保留当前已有的有效修改，先检查现状，再完成剩余工作并验证结果。`;
+}
+
+async function recoverTurn(mode) {
+  const recovery = activeRecovery;
+  if (!recovery || busy || !["continue", "retry"].includes(mode)) return;
+  if (mode === "retry" && recovery.can_retry !== true) return;
+  followLatestMessage = true;
+  liveTurnNumber = Number(currentSnapshot && currentSnapshot.status && currentSnapshot.status.turns || 0) + 1;
+  addMessage("user", recoveryPrompt(mode, recovery), { turn: liveTurnNumber });
+  lastAssistantText = "";
+  activeAssistant = null;
+  activeRecovery = null;
+  $$(".recovery-card").forEach((item) => item.remove());
+  setBusy(true, mode === "retry" ? "正在恢复" : "正在继续");
+  try {
+    const response = await request("/api/recover", {
+      method: "POST",
+      body: JSON.stringify({ mode }),
+    });
+    await consumeTurnResponse(response);
+  } catch (error) {
+    setRunError(error.message || "无法恢复这项任务");
   } finally {
     if (busy) setBusy(false);
   }
@@ -904,6 +1429,45 @@ async function stopTaskFromApproval() {
   if (await cancelTurn()) {
     pendingApproval = null;
     ui.approvalModal.hidden = true;
+  }
+}
+
+function openCompactContext() {
+  if (busy || compacting || !contextCanCompact()) return;
+  ui.compactModal.hidden = false;
+  ui.confirmCompact.focus();
+}
+
+async function compactContext() {
+  if (busy || compacting) return;
+  compacting = true;
+  ui.confirmCompact.disabled = true;
+  ui.confirmCompact.textContent = "正在压缩…";
+  ui.compactButton.disabled = true;
+  try {
+    const snapshot = await jsonRequest("/api/context/compact", {
+      method: "POST",
+      body: "{}",
+    });
+    const report = snapshot.compaction || {};
+    renderSnapshot(snapshot);
+    ui.compactModal.hidden = true;
+    if (report.compacted) {
+      const before = Number(report.before_chars || 0);
+      const after = Number(report.after_chars || 0);
+      addSystemNote(`上下文已手动压缩：${before.toLocaleString("zh-CN")} → ${after.toLocaleString("zh-CN")} 字符`);
+      addActivity("手动压缩上下文", `释放 ${(Math.max(0, before - after)).toLocaleString("zh-CN")} 字符`, "success");
+      toast("上下文已压缩，完整聊天记录仍然保留");
+    } else {
+      toast("当前上下文还很短，暂时不需要压缩", "warning");
+    }
+  } catch (error) {
+    toast(error.message || "无法压缩上下文", "error");
+  } finally {
+    compacting = false;
+    ui.confirmCompact.disabled = false;
+    ui.confirmCompact.textContent = "立即压缩";
+    ui.compactButton.disabled = busy || !contextCanCompact();
   }
 }
 
@@ -939,6 +1503,225 @@ async function resumeSession(id) {
     ui.input.focus();
     const drifted = snapshot.resume && snapshot.resume.drifted ? snapshot.resume.drifted.length : 0;
     toast(drifted ? `会话已恢复；${drifted} 个文件在关闭期间发生变化` : "会话已恢复", drifted ? "warning" : "info");
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+async function pinSession(id, pinned) {
+  if (busy) return;
+  try {
+    const snapshot = await jsonRequest("/api/session/pin", {
+      method: "POST",
+      body: JSON.stringify({ id, pinned }),
+    });
+    renderSnapshot(snapshot);
+    toast(pinned ? "会话已固定" : "已取消固定");
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+function openRenameSession(session) {
+  pendingRenameSession = session.session_id;
+  ui.renameInput.value = session.title || session.task_preview || "";
+  ui.renameModal.hidden = false;
+  window.setTimeout(() => {
+    ui.renameInput.focus();
+    ui.renameInput.select();
+  }, 0);
+}
+
+async function saveSessionRename() {
+  const id = pendingRenameSession;
+  const title = ui.renameInput.value.trim();
+  if (!id || !title) return;
+  try {
+    const snapshot = await jsonRequest("/api/session/rename", {
+      method: "POST",
+      body: JSON.stringify({ id, title }),
+    });
+    ui.renameModal.hidden = true;
+    pendingRenameSession = null;
+    renderSnapshot(snapshot);
+    toast("会话已重命名");
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+async function exportSession(id) {
+  try {
+    const response = await request(`/api/session/export?id=${encodeURIComponent(id)}`);
+    const blob = await response.blob();
+    const disposition = response.headers.get("Content-Disposition") || "";
+    const match = /filename\*=UTF-8''([^;]+)/i.exec(disposition);
+    const filename = match ? decodeURIComponent(match[1]) : `rivet-${id}.md`;
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    link.click();
+    URL.revokeObjectURL(url);
+    toast("会话已导出为 Markdown");
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+function askForConfirmation(title, message, action) {
+  pendingConfirmAction = action;
+  ui.confirmTitle.textContent = title;
+  ui.confirmMessage.textContent = message;
+  ui.confirmModal.hidden = false;
+  $("#cancelConfirmButton").focus();
+}
+
+function confirmDeleteSession(session) {
+  askForConfirmation(
+    "删除这个会话？",
+    `“${session.title || session.task_preview || "未命名会话"}”的本地会话记录将被永久删除，项目文件不会受到影响。`,
+    async () => {
+      const snapshot = await jsonRequest("/api/session/delete", {
+        method: "POST",
+        body: JSON.stringify({ id: session.session_id }),
+      });
+      renderSnapshot(snapshot);
+      toast("会话记录已删除");
+    },
+  );
+}
+
+function confirmUndoOperation(operation) {
+  const fileCount = Number(operation.file_count || 0);
+  askForConfirmation(
+    "撤销本轮修改？",
+    `将恢复第 ${operation.turn} 轮修改涉及的 ${fileCount} 个文件。后续无关修改不会受到影响。`,
+    async () => {
+      const snapshot = await jsonRequest("/api/undo", {
+        method: "POST",
+        body: JSON.stringify({ operation_id: operation.id }),
+      });
+      renderSnapshot(snapshot);
+      const count = snapshot.undo && Number(snapshot.undo.file_count || 0);
+      toast(`已撤销第 ${operation.turn} 轮对 ${count} 个文件的修改`);
+    },
+  );
+}
+
+function renderUndoActions(operations) {
+  $$(".turn-undo-action").forEach((item) => item.remove());
+  if (!Array.isArray(operations)) return;
+  for (const operation of operations) {
+    if (!operation || !Number.isInteger(operation.turn) || !operation.file_count) continue;
+    const messages = $$(`.message.assistant[data-turn="${operation.turn}"]`);
+    const message = messages.at(-1);
+    if (!message) continue;
+    const content = message.querySelector(".message-content");
+    if (!content) continue;
+
+    const actions = document.createElement("div");
+    actions.className = "message-actions turn-undo-action";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "turn-undo-button";
+    button.innerHTML = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M9 7H5v-4"/><path d="M5.5 7.5A8 8 0 1 1 4 14"/></svg><span></span>';
+    const label = button.querySelector("span");
+    if (operation.status === "undone") {
+      label.textContent = "本轮修改已撤销";
+      button.disabled = true;
+    } else if (!operation.can_undo) {
+      label.textContent = "本轮修改无法撤销";
+      button.disabled = true;
+      button.title = operation.blocked_reason || "相关文件已发生后续变化";
+    } else {
+      label.textContent = "撤销本轮修改";
+      button.title = `恢复本轮修改的 ${operation.file_count} 个文件`;
+      button.addEventListener("click", () => confirmUndoOperation(operation));
+    }
+    actions.append(button);
+    content.append(actions);
+  }
+}
+
+function recoveryReasonLabel(reason) {
+  const labels = {
+    cancelled: "任务已由用户停止",
+    max_steps: "已达到单轮步骤上限",
+    repeated_tool_call: "检测到重复工具调用",
+    unverified_changes: "修改尚未通过验证",
+    incomplete_plan: "计划仍有未完成步骤",
+    empty_model_response: "模型没有返回有效内容",
+    blocked: "任务被外部条件阻塞",
+    runtime_error: "模型或本地运行发生错误",
+  };
+  return labels[reason] || "任务在完成前停止";
+}
+
+function renderRecovery(recovery) {
+  $$(".recovery-card").forEach((item) => item.remove());
+  activeRecovery = recovery && recovery.available ? recovery : null;
+  if (!activeRecovery) return;
+
+  const card = document.createElement("div");
+  card.className = "recovery-card";
+  const heading = document.createElement("div");
+  heading.className = "recovery-card-heading";
+  const icon = document.createElement("span");
+  icon.className = "recovery-card-icon";
+  icon.innerHTML = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 8v4l2.5 1.5"/><path d="M5.5 7.5H2.5v-3"/><path d="M4 7a8.5 8.5 0 1 1-.5 9"/></svg>';
+  const copy = document.createElement("div");
+  copy.className = "recovery-card-copy";
+  const title = document.createElement("strong");
+  title.textContent = "这项任务可以恢复";
+  const detail = document.createElement("span");
+  detail.textContent = `${recoveryReasonLabel(activeRecovery.reason)}。你可以保留当前进度继续，或恢复文件后重新尝试。`;
+  copy.append(title, detail);
+  heading.append(icon, copy);
+
+  const actions = document.createElement("div");
+  actions.className = "recovery-actions";
+  const continueButton = document.createElement("button");
+  continueButton.type = "button";
+  continueButton.className = "primary";
+  continueButton.textContent = "继续任务";
+  continueButton.addEventListener("click", () => recoverTurn("continue"));
+  const retryButton = document.createElement("button");
+  retryButton.type = "button";
+  retryButton.textContent = "恢复并重试";
+  retryButton.dataset.blocked = String(activeRecovery.can_retry !== true);
+  retryButton.disabled = busy || activeRecovery.can_retry !== true;
+  retryButton.title = activeRecovery.can_retry === true
+    ? "恢复失败轮次开始前的文件状态并重新执行"
+    : activeRecovery.retry_blocked_reason || "没有可用的安全撤销点";
+  retryButton.addEventListener("click", () => recoverTurn("retry"));
+  actions.append(continueButton, retryButton);
+  card.append(heading, actions);
+
+  if (activeRecovery.can_retry !== true && activeRecovery.retry_blocked_reason) {
+    const note = document.createElement("p");
+    note.className = "recovery-blocked-note";
+    note.textContent = `无法安全重试：${activeRecovery.retry_blocked_reason}`;
+    card.append(note);
+  }
+
+  const messages = $$(`.message.assistant[data-turn="${activeRecovery.turn}"]`);
+  const content = messages.at(-1) && messages.at(-1).querySelector(".message-content");
+  if (content) {
+    content.append(card);
+  } else {
+    showConversation();
+    ui.messages.append(card);
+  }
+}
+
+async function acceptConfirmation() {
+  const action = pendingConfirmAction;
+  if (!action) return;
+  pendingConfirmAction = null;
+  ui.confirmModal.hidden = true;
+  try {
+    await action();
   } catch (error) {
     toast(error.message, "error");
   }
@@ -1127,6 +1910,20 @@ async function showDiff() {
   }
 }
 
+async function showFileDiff() {
+  if (!activePreviewPath) return;
+  ui.fileModal.hidden = true;
+  ui.diffModal.hidden = false;
+  ui.diffActivePath.textContent = "正在读取改动…";
+  ui.diffContent.textContent = "正在读取…";
+  try {
+    renderDiff(await jsonRequest(`/api/diff?path=${encodeURIComponent(activePreviewPath)}`));
+  } catch (error) {
+    ui.diffActivePath.textContent = "无法读取改动";
+    ui.diffContent.textContent = error.message;
+  }
+}
+
 function resizeComposer() {
   ui.input.style.height = "auto";
   ui.input.style.height = `${Math.min(ui.input.scrollHeight, 170)}px`;
@@ -1174,12 +1971,66 @@ ui.conversation.addEventListener("scroll", () => {
   followLatestMessage = conversationIsNearBottom();
 }, { passive: true });
 ui.newSession.addEventListener("click", newSession);
+ui.sessionSearch.addEventListener("input", () => renderSessionList());
+ui.fileSearch.addEventListener("input", () => renderWorkspaceFiles());
 $("#refreshSessionsButton").addEventListener("click", bootstrap);
+$("#refreshFilesButton").addEventListener("click", loadWorkspaceFiles);
 $("#diffButton").addEventListener("click", showDiff);
+ui.compactButton.addEventListener("click", openCompactContext);
+ui.approvalModeTrigger.addEventListener("click", () => {
+  setApprovalMenu(ui.approvalModeMenu.hidden);
+});
+ui.approvalModeMenu.addEventListener("click", (event) => {
+  const option = event.target.closest(".approval-mode-option");
+  if (option) changeApprovalMode(option.dataset.approvalMode);
+});
+ui.approvalModeMenu.addEventListener("keydown", (event) => {
+  const options = $$(".approval-mode-option");
+  const current = options.indexOf(document.activeElement);
+  let next = null;
+  if (event.key === "ArrowDown") next = (current + 1 + options.length) % options.length;
+  if (event.key === "ArrowUp") next = (current - 1 + options.length) % options.length;
+  if (event.key === "Home") next = 0;
+  if (event.key === "End") next = options.length - 1;
+  if (next !== null) {
+    event.preventDefault();
+    options[next].focus();
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    setApprovalMenu(false);
+    ui.approvalModeTrigger.focus();
+  }
+});
+document.addEventListener("click", (event) => {
+  if (!ui.approvalModeControl.contains(event.target)) setApprovalMenu(false);
+});
+$("#cancelCompactButton").addEventListener("click", () => { ui.compactModal.hidden = true; });
+ui.confirmCompact.addEventListener("click", compactContext);
+ui.compactModal.addEventListener("click", (event) => {
+  if (event.target === ui.compactModal && !compacting) ui.compactModal.hidden = true;
+});
 $("#closeDiffButton").addEventListener("click", () => { ui.diffModal.hidden = true; });
 ui.diffModal.addEventListener("click", (event) => {
   if (event.target === ui.diffModal) ui.diffModal.hidden = true;
 });
+$("#closeFileButton").addEventListener("click", () => { ui.fileModal.hidden = true; });
+ui.fileModal.addEventListener("click", (event) => {
+  if (event.target === ui.fileModal) ui.fileModal.hidden = true;
+});
+ui.fileDiff.addEventListener("click", showFileDiff);
+$("#cancelRenameButton").addEventListener("click", () => {
+  ui.renameModal.hidden = true;
+  pendingRenameSession = null;
+});
+$("#saveRenameButton").addEventListener("click", saveSessionRename);
+ui.renameInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") saveSessionRename();
+});
+$("#cancelConfirmButton").addEventListener("click", () => {
+  ui.confirmModal.hidden = true;
+  pendingConfirmAction = null;
+});
+$("#acceptConfirmButton").addEventListener("click", acceptConfirmation);
 ui.approve.addEventListener("click", () => answerApproval(true));
 ui.reject.addEventListener("click", () => answerApproval(false));
 ui.stopApprovalTask.addEventListener("click", stopTaskFromApproval);
@@ -1191,12 +2042,31 @@ ui.backdrop.addEventListener("click", closeMobilePanels);
 $$('.tab').forEach((tab) => tab.addEventListener("click", () => switchTab(tab.dataset.tab)));
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
-  if (!ui.approvalModal.hidden) {
+  if (!ui.approvalModeMenu.hidden) {
+    setApprovalMenu(false);
+    ui.approvalModeTrigger.focus();
+  } else if (!ui.approvalModal.hidden) {
     answerApproval(false);
   } else if (!ui.diffModal.hidden) {
     ui.diffModal.hidden = true;
+  } else if (!ui.fileModal.hidden) {
+    ui.fileModal.hidden = true;
+  } else if (!ui.renameModal.hidden) {
+    ui.renameModal.hidden = true;
+    pendingRenameSession = null;
+  } else if (!ui.compactModal.hidden && !compacting) {
+    ui.compactModal.hidden = true;
+  } else if (!ui.confirmModal.hidden) {
+    ui.confirmModal.hidden = true;
+    pendingConfirmAction = null;
   } else {
     closeMobilePanels();
+  }
+});
+
+document.addEventListener("click", (event) => {
+  if (!event.target.closest(".session-actions")) {
+    $$(".session-menu.open").forEach((menu) => menu.classList.remove("open"));
   }
 });
 

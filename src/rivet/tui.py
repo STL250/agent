@@ -45,6 +45,8 @@ class Console:
         ("/status", "/status", "show conversation and verification state"),
         ("/plan", "/plan", "show the current task plan"),
         ("/diff", "/diff [path]", "show changes from this conversation"),
+        ("/skills", "/skills", "show available and recently used skills"),
+        ("/permissions", "/permissions [mode]", "show or switch safe, ask, or never mode"),
         ("/sessions", "/sessions", "list recent saved conversations"),
         ("/resume", "/resume [id]", "resume the latest or selected conversation"),
         ("/new", "/new", "start a fresh conversation"),
@@ -62,6 +64,9 @@ class Console:
         "run_command": "Run",
         "delegate_task": "Delegate",
         "delegate_readonly_tasks": "Parallel delegate",
+        "list_skills": "List skills",
+        "activate_skill": "Activate skill",
+        "read_skill_resource": "Read skill resource",
     }
     UNICODE_GLYPHS = {
         "top": "┌─",
@@ -240,6 +245,22 @@ class Console:
                 f"    {marker} {label}" + (f"  {summary}" if summary else ""),
                 file=self.output,
             )
+        elif event == "skill_activated":
+            name = str(data.get("name") or "skill")
+            source = str(data.get("source") or "")
+            marker = self.style(self.glyph("success"), self.GREEN)
+            print(
+                f"    {marker} Skill activated  {name}"
+                + (f" [{source}]" if source else ""),
+                file=self.output,
+            )
+        elif event == "skill_resource_read":
+            name = str(data.get("name") or "skill")
+            path = str(data.get("path") or "resource")
+            print(
+                self.style(f"    {self.glyph('pipe')} {name} · {path}", self.DIM),
+                file=self.output,
+            )
         elif event == "plan_updated":
             self.plan(data, title="Plan updated")
         elif event == "plan_completion_required":
@@ -332,6 +353,7 @@ class Console:
         print(f"  inspected   {inspected}", file=self.output)
         print(f"  changed     {changed}", file=self.output)
         print(f"  verification {verification}", file=self.output)
+        print(f"  permissions {status.get('approval_mode', 'safe')}", file=self.output)
         tracking = "complete" if status.get("workspace_tracking_complete", True) else "limited"
         print(f"  tracking    {tracking}", file=self.output)
         plan = status.get("plan", {})
@@ -351,6 +373,46 @@ class Console:
             history_count = len(history) if isinstance(history, list) else 0
             print(
                 f"  sub-agents  {active_count} active | {history_count} report(s)",
+                file=self.output,
+            )
+        skills = status.get("skills", {})
+        if isinstance(skills, dict):
+            available = skills.get("available", [])
+            active = skills.get("active", [])
+            history = skills.get("history", [])
+            print(
+                f"  skills      {len(active) if isinstance(active, list) else 0} active | "
+                f"{len(available) if isinstance(available, list) else 0} available | "
+                f"{len(history) if isinstance(history, list) else 0} use(s)",
+                file=self.output,
+            )
+
+    def skills(self, snapshot: JsonObject) -> None:
+        print(self.style("\nSkills", self.BOLD), file=self.output)
+        available = snapshot.get("available", [])
+        if not isinstance(available, list) or not available:
+            print("  no skills available", file=self.output)
+            return
+        for item in available:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "skill")
+            source = str(item.get("source") or "")
+            if item.get("active"):
+                state = self.style("active", self.GREEN)
+            elif item.get("used_count"):
+                state = self.style(f"used {item['used_count']}x", self.CYAN)
+            else:
+                state = self.style("available", self.DIM)
+            print(
+                f"  {self.style(name, self.CYAN, self.BOLD)}  [{source}]  {state}",
+                file=self.output,
+            )
+            print(f"    {item.get('description', '')}", file=self.output)
+        errors = snapshot.get("errors", [])
+        if isinstance(errors, list) and errors:
+            print(
+                self.style(f"  {len(errors)} invalid skill(s) were skipped", self.YELLOW),
                 file=self.output,
             )
 
@@ -784,6 +846,10 @@ class Console:
             tasks = arguments.get("tasks", [])
             count = len(tasks) if isinstance(tasks, list) else 0
             return f"{count} read-only sub-agent(s)"
+        if name == "activate_skill":
+            return str(arguments.get("name") or "")
+        if name == "read_skill_resource":
+            return f"{arguments.get('skill', '')} · {arguments.get('path', '')}"
         if name == "search_text":
             query = cls._truncate(str(arguments.get("query") or ""), 70)
             path = str(arguments.get("path") or ".")
@@ -834,6 +900,13 @@ class Console:
             )
         if name == "delegate_readonly_tasks":
             return f"{result.get('report_count', 0)} report(s) returned"
+        if name == "list_skills":
+            return f"{result.get('count', 0)} skill(s) available"
+        if name == "activate_skill":
+            state = "already active" if result.get("already_active") else "activated"
+            return f"{result.get('name', 'skill')} | {state}"
+        if name == "read_skill_resource":
+            return f"{result.get('name', 'skill')} · {result.get('path', '')}"
         return str(result.get("path") or "done")
 
     def _text_block(self, speaker: str, text: str) -> None:

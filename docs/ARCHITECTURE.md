@@ -16,6 +16,7 @@ repeated user turns
         ^  |                    |
         |  |                    v
         |  |             SubAgentManager ---- isolated child Agent(s)
+        |  +------------- SkillRegistry ---- progressive SKILL.md disclosure
         | SessionStore
         |  ^
         |  |
@@ -47,6 +48,7 @@ clearing conversation state and creating a fresh tool/diff boundary.
 | Terminal presentation | `Console` in `tui.py` renders compact semantic events with ANSI and plain-text modes |
 | Browser presentation | `WebRuntime` streams the same semantic events to a local two-column chat workspace |
 | Multi-agent orchestration | `SubAgentManager` creates bounded child Agents, enforces depth and mode limits, and returns structured reports |
+| Reusable workflows | `SkillRegistry` discovers scoped `SKILL.md` files, discloses instructions on demand, and records usage |
 | Tool definitions | JSON-schema function tools in `ToolRegistry` with local validation and permission-scoped visibility |
 | Local execution | `Workspace` reads, searches, atomically edits, and runs bounded subprocesses |
 | Output parsing | `OpenAICompatibleClient` validates JSON replies, rebuilds SSE/tool deltas, and retains configured replay fields |
@@ -93,6 +95,12 @@ rendered through a safe DOM-based Markdown subset with copyable code blocks, whi
 diffs are parsed into per-file, line-numbered views. No provider credential is serialized to
 the browser.
 
+The top bar can switch `safe`, `ask`, and `never` while the Agent is idle. The token-protected
+settings endpoint replaces the immutable runtime configuration and updates the Agent and active
+tool registry together; it refuses changes during a turn or approval wait. This is a process
+preference rather than session data, so a restart returns to the CLI or `.env` default. The TUI
+exposes the same operation through `/permissions [mode]`.
+
 The server is intentionally local-only: it rejects non-loopback host/origin values, requires a
 random per-process request token, sends no CORS permission, and applies a restrictive content
 security policy. It is not a hosted control plane and does not make the selected workspace
@@ -110,14 +118,31 @@ remotely accessible.
 - `run_command`: cancellable subprocess group in the workspace with timeout, bounded output,
   stripped credential variables, a blocklist for obviously destructive/external commands,
   and before/after workspace snapshots that detect indirect file changes.
-- `delegate_task`: one bounded exploration, implementation, or review assignment with an
+- `delegate_task`: one bounded exploration or review assignment with an
   isolated context and structured result.
-- `delegate_readonly_tasks`: two or three independent exploration/review assignments executed
+- `delegate_readonly_tasks`: exactly two independent exploration/review assignments executed
   concurrently with separate model clients.
+- `list_skills`: skill metadata and activation state without instruction bodies.
+- `activate_skill`: disclose one relevant `SKILL.md` workflow for the current turn.
+- `read_skill_resource`: read one listed UTF-8 resource from an already active skill.
 
 Tool schemas are sent to the model and enforced again by `ToolRegistry`. Required fields,
 unknown fields, scalar types, ranges, and string sizes are rejected before approval or local
 execution. Errors include a stable code, field name when relevant, and retryability hint.
+
+## Skills
+
+`SkillRegistry` discovers immediate child directories under the packaged built-in skill root,
+the user's `~/.rivet/skills`, and the current project's `.rivet/skills`; later scopes override
+same-named earlier ones. Startup puts only validated names, descriptions, and source labels in
+the system catalog. The model must call `activate_skill` before instructions enter the ReAct
+context, and `read_skill_resource` accepts only resources pre-listed for that active skill.
+
+Skill names and front matter are bounded and validated without a YAML dependency. Symlinked,
+oversized, binary, path-escaping, or malformed content is rejected. Reading a resource never
+executes it, and skill text remains subordinate to system safety, user intent, workspace
+permissions, and the normal approval gate. Each turn starts with no active skill; activation
+history is persisted so resumed sessions and both interfaces can show what was used.
 
 ## Multi-agent orchestration
 
@@ -128,16 +153,14 @@ containing status, summary, inspected files, command evidence, changed files, ve
 and risks. Child transcripts are not copied into the parent's context.
 
 `explore` and `review` registries expose only planning, listing, reading, searching, and diff
-tools. `implement` exposes the normal workspace tools and inherits the user's approval mode.
-Children are created with delegation disabled, which fixes orchestration depth at one. A
-per-turn count prevents runaway fan-out; independent read-only tasks may use a bounded thread
-pool, while implementation remains single-assignment and serialized. Each parallel child gets
-its own protocol client so cancellation and streamed responses do not share HTTP state.
+tools. Children are created with delegation disabled, which fixes orchestration depth at one.
+A per-turn count prevents runaway fan-out; exactly two independent read-only tasks may use a
+bounded thread pool. Each parallel child gets its own protocol client so cancellation and
+streamed responses do not share HTTP state.
 
-All child Agents share the parent's `Workspace` object. This preserves the original text
-baseline when a child edits a file, so parent `/diff`, completion evidence, and session restore
-remain accurate. Verified child changes are represented as a mutation followed by successful
-verification in `TaskState`; unverified child changes keep the parent's completion gate open.
+All child Agents share the parent's `Workspace` object only for a consistent read-only view of
+the current diff baseline. They cannot edit files or run commands; the main Agent owns every
+mutation, integration decision, and verification result.
 The active child set and recent reports are available through `Agent.status()`, persisted with
 the session, and rendered as semantic status events in both interfaces. Cancelling the parent
 sets the shared cancellation event and closes every active child's model request.
@@ -208,7 +231,7 @@ request is appended to the same history after the preceding assistant final answ
 references such as "the function you just changed" have the required conversational context.
 Each user turn receives a fresh step budget and loop-protection counters, while successful
 tool evidence and the workspace diff remain session-wide. `/plan`, `/status`, `/diff`, `/sessions`,
-`/resume`, `/new`, and `/exit` expose the essential session controls. `/resume` without an
+`/resume`, `/skills`, `/new`, and `/exit` expose the essential session controls. `/resume` without an
 argument loads the most recently updated valid session; an ID from `/sessions` selects a
 specific one. `/new` resets the Agent and creates a new `ToolRegistry`, so conversation
 history and the in-memory diff baseline do not leak across conversations.

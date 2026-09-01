@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, BinaryIO
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .agent import Agent, AgentResult
 from .config import Config
@@ -49,6 +49,8 @@ class WebRuntime:
         )
 
     def snapshot(self) -> JsonObject:
+        status = self._web_status()
+        diff = self.agent.tools.workspace.preview_diff()
         return {
             "config": {
                 "model": self.config.model,
@@ -56,47 +58,122 @@ class WebRuntime:
                 "workspace": str(self.config.workspace),
                 "workspace_name": self.config.workspace.name,
                 "approval": self.config.approval_mode,
+                "max_steps": self.config.max_steps,
+                "max_context_chars": self.config.max_context_chars,
+                "command_timeout": self.config.command_timeout,
+                "subagent_max_steps": self.config.subagent_max_steps,
+                "max_subagents_per_turn": min(
+                    2, self.config.max_subagents_per_turn
+                ),
+                "subagent_parallelism": min(
+                    2,
+                    self.config.subagent_parallelism,
+                    self.config.max_subagents_per_turn,
+                ),
             },
-            "status": self.agent.status(),
+            "status": status,
             "plan": self.agent.plan_snapshot(),
-            "diff": self.agent.show_diff(),
-            "sessions": [self._session_payload(item) for item in self.sessions.list_sessions()],
+            "diff": self._redact_payload(diff),
+            "sessions": [
+                self._session_payload(item)
+                for item in self.sessions.list_sessions(limit=100)
+            ],
             "conversation": self._visible_conversation(),
             "busy": self.turn_lock.locked(),
             "session_id": self.session_path.stem if self.session_path else None,
         }
 
     def run_turn(self, task: str, writer: BinaryIO) -> None:
+        self._run_stream(task, writer)
+
+    def recover_turn(self, mode: str, writer: BinaryIO) -> None:
+        if mode not in {"continue", "retry"}:
+            raise ValueError("recovery mode must be continue or retry")
+        self._run_stream("", writer, recovery_mode=mode)
+
+    def _run_stream(
+        self,
+        task: str,
+        writer: BinaryIO,
+        *,
+        recovery_mode: str | None = None,
+    ) -> None:
         if not self.turn_lock.acquire(blocking=False):
             raise RuntimeError("Rivet is already processing another turn")
         try:
             self.writer = writer
+            if recovery_mode is not None:
+                recovery = self.agent.recovery_snapshot()
+                if recovery.get("available") is not True:
+                    self._write_record(
+                        {
+                            "type": "recovery_error",
+                            "message": "当前没有可以恢复的失败任务",
+                            "snapshot": self.snapshot(),
+                        }
+                    )
+                    return
+                original_task = str(recovery.get("task") or "").strip()
+                if recovery_mode == "retry":
+                    try:
+                        restored = self.agent.prepare_retry(
+                            recovery.get("retry_operation_id")
+                            if isinstance(recovery.get("retry_operation_id"), int)
+                            else None
+                        )
+                    except RivetError as exc:
+                        self._write_record(
+                            {
+                                "type": "recovery_error",
+                                "message": str(exc),
+                                "snapshot": self.snapshot(),
+                            }
+                        )
+                        return
+                    task = (
+                        f'重新尝试上一轮任务：“{original_task}”。'
+                        "失败轮次产生的文件修改已安全恢复；请重新分析，完成任务并验证结果。"
+                    )
+                    self._emit(
+                        "recovery_started",
+                        {
+                            "mode": "retry",
+                            "restored_files": restored.get("files", []),
+                        },
+                    )
+                else:
+                    task = (
+                        f'继续完成上一轮未完成的任务：“{original_task}”。'
+                        "保留当前已有的有效修改，先检查现状，再完成剩余工作并验证结果。"
+                    )
+                    self._emit(
+                        "recovery_started",
+                        {"mode": "continue", "restored_files": []},
+                    )
             self._emit("turn_started", {"task": task})
             try:
                 result = self.agent.run(task)
-                first_save = self.session_path is None
-                try:
-                    self.session_path = self.sessions.save(
-                        self.agent, result, target=self.session_path
-                    )
-                except RivetError as exc:
-                    self._emit("session_error", {"message": str(exc)})
-                if first_save and self.session_path is not None:
-                    self._emit("session_saved", {"id": self.session_path.stem})
-                self._write_record(
-                    {
-                        "type": "turn_complete",
-                        "result": self._result_payload(result),
-                        "snapshot": self.snapshot(),
-                    }
-                )
             except RivetError as exc:
-                self._write_record({"type": "fatal_error", "message": str(exc)})
+                try:
+                    result = self.agent.record_failure(
+                        f"任务因运行错误而停止：{exc}", "runtime_error"
+                    )
+                except RivetError:
+                    self._write_record({"type": "fatal_error", "message": str(exc)})
+                    return
             except Exception:
                 print("Unexpected error while processing a web turn", file=sys.stderr)
-                self._write_record(
-                    {"type": "fatal_error", "message": "Unexpected local server error"}
-                )
+                try:
+                    result = self.agent.record_failure(
+                        "任务因本地运行错误而停止，请检查配置后重试。",
+                        "runtime_error",
+                    )
+                except RivetError:
+                    self._write_record(
+                        {"type": "fatal_error", "message": "Unexpected local server error"}
+                    )
+                    return
+            self._finish_web_turn(result)
         finally:
             with self.approval_condition:
                 if self.pending_approval is not None:
@@ -105,6 +182,24 @@ class WebRuntime:
                 self.pending_approval = None
             self.writer = None
             self.turn_lock.release()
+
+    def _finish_web_turn(self, result: AgentResult) -> None:
+        first_save = self.session_path is None
+        try:
+            self.session_path = self.sessions.save(
+                self.agent, result, target=self.session_path
+            )
+        except RivetError as exc:
+            self._emit("session_error", {"message": str(exc)})
+        if first_save and self.session_path is not None:
+            self._emit("session_saved", {"id": self.session_path.stem})
+        self._write_record(
+            {
+                "type": "turn_complete",
+                "result": self._result_payload(result),
+                "snapshot": self.snapshot(),
+            }
+        )
 
     def new_session(self) -> JsonObject:
         if not self.turn_lock.acquire(blocking=False):
@@ -129,6 +224,124 @@ class WebRuntime:
                 "drifted": drifted,
                 "saved_model": loaded.summary.model,
             }
+            return snapshot
+        finally:
+            self.turn_lock.release()
+
+    def list_workspace_files(self) -> JsonObject:
+        workspace = self.agent.tools.workspace
+        result = workspace.list_files(".", depth=32, max_entries=5000)
+        entries = result.get("entries", [])
+        if isinstance(entries, list):
+            result["entries"] = [
+                item
+                for item in entries
+                if isinstance(item, str) and workspace.preview_allowed(item)
+            ]
+        safe_diff = workspace.preview_diff()
+        result["changed_files"] = safe_diff.get("files", [])
+        result["hidden_files"] = safe_diff.get("hidden_files", 0)
+        return result
+
+    def preview_workspace_file(self, path: str) -> JsonObject:
+        return self.agent.tools.workspace.preview_file(path)
+
+    def preview_diff(self, path: str | None = None) -> JsonObject:
+        return self._redact_payload(self.agent.tools.workspace.preview_diff(path))
+
+    def rename_session(self, reference: str, title: str) -> JsonObject:
+        if not self.turn_lock.acquire(blocking=False):
+            raise RuntimeError("wait for the current turn to finish")
+        try:
+            self.sessions.rename(reference, title)
+            return self.snapshot()
+        finally:
+            self.turn_lock.release()
+
+    def pin_session(self, reference: str, pinned: bool) -> JsonObject:
+        if not self.turn_lock.acquire(blocking=False):
+            raise RuntimeError("wait for the current turn to finish")
+        try:
+            self.sessions.set_pinned(reference, pinned)
+            return self.snapshot()
+        finally:
+            self.turn_lock.release()
+
+    def delete_session(self, reference: str) -> JsonObject:
+        if not self.turn_lock.acquire(blocking=False):
+            raise RuntimeError("wait for the current turn to finish")
+        try:
+            deleted = self.sessions.delete(reference)
+            if self.session_path is not None and self.session_path.stem == deleted:
+                self.agent.reset()
+                self.session_path = None
+            snapshot = self.snapshot()
+            snapshot["deleted_session"] = deleted
+            return snapshot
+        finally:
+            self.turn_lock.release()
+
+    def revert_changes(self, path: str | None) -> JsonObject:
+        if not self.turn_lock.acquire(blocking=False):
+            raise RuntimeError("wait for the current turn to finish")
+        try:
+            workspace = self.agent.tools.workspace
+            if path is not None and not workspace.preview_allowed(path):
+                raise ValueError("sensitive files cannot be restored from the Web UI")
+            if path is None:
+                changed = self.agent.show_diff().get("files", [])
+                hidden = [
+                    item
+                    for item in changed
+                    if isinstance(item, str) and not workspace.preview_allowed(item)
+                ]
+                if hidden:
+                    raise ValueError(
+                        "review sensitive file changes in the terminal before restoring"
+                    )
+            result = self.agent.revert_changes(path)
+            if self.session_path is not None:
+                self.sessions.update_agent_state(self.session_path, self.agent)
+            snapshot = self.snapshot()
+            snapshot["revert"] = result
+            return snapshot
+        finally:
+            self.turn_lock.release()
+
+    def undo_operation(self, operation_id: int) -> JsonObject:
+        if not self.turn_lock.acquire(blocking=False):
+            raise RuntimeError("wait for the current turn to finish")
+        try:
+            result = self.agent.undo_operation(operation_id)
+            if self.session_path is not None:
+                self.sessions.update_agent_state(self.session_path, self.agent)
+            snapshot = self.snapshot()
+            snapshot["undo"] = result
+            return snapshot
+        finally:
+            self.turn_lock.release()
+
+    def compact_context(self) -> JsonObject:
+        if not self.turn_lock.acquire(blocking=False):
+            raise RuntimeError("wait for the current turn to finish")
+        try:
+            report = self.agent.compact_context()
+            if report.get("compacted") is True and self.session_path is not None:
+                self.sessions.update_agent_state(self.session_path, self.agent)
+            snapshot = self.snapshot()
+            snapshot["compaction"] = report
+            return snapshot
+        finally:
+            self.turn_lock.release()
+
+    def set_approval_mode(self, mode: str) -> JsonObject:
+        if not self.turn_lock.acquire(blocking=False):
+            raise RuntimeError("wait for the current turn to finish")
+        try:
+            result = self.agent.set_approval_mode(mode)
+            self.config = self.agent.config
+            snapshot = self.snapshot()
+            snapshot["approval_update"] = result
             return snapshot
         finally:
             self.turn_lock.release()
@@ -196,21 +409,54 @@ class WebRuntime:
                 self.writer = None
 
     def _visible_conversation(self) -> list[JsonObject]:
-        visible: list[JsonObject] = []
-        task_index = 0
-        for message in self.agent.messages:
-            role = message.get("role")
-            content = message.get("content")
-            if not isinstance(content, str) or not content.strip():
-                continue
-            if role == "user":
-                if task_index >= len(self.agent.tasks) or content != self.agent.tasks[task_index]:
+        return [
+            {
+                "role": str(message.get("role") or "assistant"),
+                "content": self._redact_text(str(message.get("content") or "")),
+                "turn": int(message.get("turn") or 0),
+            }
+            for message in self.agent.transcript
+        ]
+
+    def _web_status(self) -> JsonObject:
+        status = self._redact_payload(self.agent.status())
+        for name in ("inspected_files", "changed_files"):
+            values = status.get(name, [])
+            if isinstance(values, list):
+                status[name] = [
+                    item
+                    for item in values
+                    if isinstance(item, str)
+                    and self.agent.tools.workspace.preview_allowed(item)
+                ]
+        operations = status.get("operations", [])
+        if isinstance(operations, list):
+            for operation in operations:
+                if not isinstance(operation, dict):
                     continue
-                task_index += 1
-                visible.append({"role": role, "content": content})
-            elif role == "assistant":
-                visible.append({"role": role, "content": content})
-        return visible
+                paths = operation.get("files", [])
+                if not isinstance(paths, list):
+                    continue
+                visible = [
+                    path
+                    for path in paths
+                    if isinstance(path, str)
+                    and self.agent.tools.workspace.preview_allowed(path)
+                ]
+                operation["files"] = visible
+                operation["hidden_file_count"] = max(0, len(paths) - len(visible))
+        return status
+
+    def _redact_payload(self, payload: JsonObject) -> JsonObject:
+        secret = self.config.api_key
+        if not secret:
+            return payload
+        encoded = json.dumps(payload, ensure_ascii=False)
+        return json.loads(encoded.replace(secret, "[REDACTED]"))
+
+    def _redact_text(self, text: str) -> str:
+        secret = self.config.api_key
+        return text.replace(secret, "[REDACTED]") if secret else text
 
     @staticmethod
     def _session_payload(summary: Any) -> JsonObject:
@@ -253,11 +499,41 @@ class RivetRequestHandler(BaseHTTPRequestHandler):
                 query = parse_qs(parsed.query)
                 path = query.get("path", [None])[0]
                 try:
-                    result = self.server.runtime.agent.show_diff(path)
+                    result = self.server.runtime.preview_diff(path)
                 except RivetError as exc:
                     self._json_error(str(exc), HTTPStatus.BAD_REQUEST)
                     return
                 self._json_response(result)
+                return
+            if parsed.path == "/api/files":
+                try:
+                    self._json_response(self.server.runtime.list_workspace_files())
+                except RivetError as exc:
+                    self._json_error(str(exc), HTTPStatus.BAD_REQUEST)
+                return
+            if parsed.path == "/api/file":
+                query = parse_qs(parsed.query)
+                path = query.get("path", [""])[0]
+                if not path:
+                    self._json_error("file path is required", HTTPStatus.BAD_REQUEST)
+                    return
+                try:
+                    self._json_response(self.server.runtime.preview_workspace_file(path))
+                except RivetError as exc:
+                    self._json_error(str(exc), HTTPStatus.BAD_REQUEST)
+                return
+            if parsed.path == "/api/session/export":
+                query = parse_qs(parsed.query)
+                reference = query.get("id", [""])[0]
+                if not reference:
+                    self._json_error("session id is required", HTTPStatus.BAD_REQUEST)
+                    return
+                try:
+                    filename, content = self.server.runtime.sessions.export_markdown(reference)
+                except RivetError as exc:
+                    self._json_error(str(exc), HTTPStatus.BAD_REQUEST)
+                    return
+                self._text_response(content, filename=filename)
                 return
             self._json_error("API route not found", HTTPStatus.NOT_FOUND)
             return
@@ -304,6 +580,35 @@ class RivetRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             return
 
+        if parsed.path == "/api/recover":
+            mode = body.get("mode")
+            if mode not in {"continue", "retry"}:
+                self._json_error(
+                    "recovery mode must be continue or retry", HTTPStatus.BAD_REQUEST
+                )
+                return
+            if runtime.turn_lock.locked():
+                self._json_error("Rivet is already working", HTTPStatus.CONFLICT)
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            try:
+                runtime.recover_turn(mode, self.wfile)
+            except (RuntimeError, ValueError) as exc:
+                encoded = (
+                    json.dumps(
+                        {"type": "recovery_error", "message": str(exc)},
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                ).encode("utf-8")
+                self.wfile.write(encoded)
+                self.wfile.flush()
+            return
+
         if parsed.path == "/api/approval":
             approval_id = body.get("id")
             approved = body.get("approved")
@@ -332,6 +637,47 @@ class RivetRequestHandler(BaseHTTPRequestHandler):
                 if reference is not None and not isinstance(reference, str):
                     raise ValueError("session id must be text")
                 self._json_response(runtime.resume_session(reference))
+                return
+            if parsed.path == "/api/session/rename":
+                reference = body.get("id")
+                title = body.get("title")
+                if not isinstance(reference, str) or not isinstance(title, str):
+                    raise ValueError("session id and title must be text")
+                self._json_response(runtime.rename_session(reference, title))
+                return
+            if parsed.path == "/api/session/pin":
+                reference = body.get("id")
+                pinned = body.get("pinned")
+                if not isinstance(reference, str) or not isinstance(pinned, bool):
+                    raise ValueError("invalid session pin request")
+                self._json_response(runtime.pin_session(reference, pinned))
+                return
+            if parsed.path == "/api/session/delete":
+                reference = body.get("id")
+                if not isinstance(reference, str):
+                    raise ValueError("session id must be text")
+                self._json_response(runtime.delete_session(reference))
+                return
+            if parsed.path == "/api/revert":
+                path = body.get("path")
+                if path is not None and not isinstance(path, str):
+                    raise ValueError("file path must be text")
+                self._json_response(runtime.revert_changes(path))
+                return
+            if parsed.path == "/api/undo":
+                operation_id = body.get("operation_id")
+                if not isinstance(operation_id, int) or isinstance(operation_id, bool):
+                    raise ValueError("operation id must be an integer")
+                self._json_response(runtime.undo_operation(operation_id))
+                return
+            if parsed.path == "/api/context/compact":
+                self._json_response(runtime.compact_context())
+                return
+            if parsed.path == "/api/settings/approval":
+                mode = body.get("mode")
+                if not isinstance(mode, str):
+                    raise ValueError("approval mode must be text")
+                self._json_response(runtime.set_approval_mode(mode))
                 return
         except (RivetError, RuntimeError, ValueError) as exc:
             self._json_error(str(exc), HTTPStatus.CONFLICT)
@@ -410,6 +756,18 @@ class RivetRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _text_response(self, content: str, *, filename: str) -> None:
+        encoded = content.encode("utf-8")
+        safe_name = quote(filename, safe="")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/markdown; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{safe_name}")
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()

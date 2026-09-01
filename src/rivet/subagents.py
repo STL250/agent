@@ -9,14 +9,12 @@ from typing import Any, Callable
 from .config import Config
 from .errors import OperationCancelled, SessionError, ToolError
 from .prompt import subagent_system_prompt
-from .tools import Approver
 from .types import EventHandler, JsonObject, ModelClient
 from .workspace import Workspace
 
 
 ClientFactory = Callable[[], ModelClient]
-SUBAGENT_MODES = {"explore", "implement", "review"}
-READ_ONLY_MODES = {"explore", "review"}
+SUBAGENT_MODES = {"explore", "review"}
 
 
 @dataclass(frozen=True)
@@ -30,9 +28,6 @@ class SubAgentReport:
     steps: int
     reason: str
     evidence: JsonObject
-    changed_files: tuple[str, ...]
-    verification: JsonObject
-    tracking_complete: bool
     risks: tuple[str, ...]
 
     def payload(self) -> JsonObject:
@@ -46,9 +41,6 @@ class SubAgentReport:
             "steps": self.steps,
             "reason": self.reason,
             "evidence": copy.deepcopy(self.evidence),
-            "changed_files": list(self.changed_files),
-            "verification": copy.deepcopy(self.verification),
-            "tracking_complete": self.tracking_complete,
             "risks": list(self.risks),
         }
 
@@ -63,15 +55,15 @@ class SubAgentManager:
         workspace: Workspace,
         *,
         event_handler: EventHandler | None = None,
-        approver: Approver | None = None,
         cancel_event: threading.Event | None = None,
     ) -> None:
         self.config = config
         self.client_factory = client_factory
         self.workspace = workspace
         self.events = event_handler or (lambda _event, _data: None)
-        self.approver = approver
         self.cancel_event = cancel_event or threading.Event()
+        self.max_per_turn = min(2, config.max_subagents_per_turn)
+        self.parallelism = min(2, config.subagent_parallelism, self.max_per_turn)
         self._lock = threading.Lock()
         self._event_lock = threading.Lock()
         self._sequence = 0
@@ -93,8 +85,8 @@ class SubAgentManager:
     def delegate_many(self, tasks: list[JsonObject]) -> JsonObject:
         if not tasks:
             raise ToolError("at least one sub-agent task is required")
-        if len(tasks) > 3:
-            raise ToolError("parallel delegation accepts at most three tasks")
+        if len(tasks) > 2:
+            raise ToolError("parallel delegation accepts at most two tasks")
         normalized: list[tuple[str, str, str]] = []
         for item in tasks:
             task = str(item.get("task") or "").strip()
@@ -102,15 +94,15 @@ class SubAgentManager:
             label = str(item.get("label") or "").strip()
             if not task:
                 raise ToolError("sub-agent task must not be empty")
-            if mode not in READ_ONLY_MODES:
+            if mode not in SUBAGENT_MODES:
                 raise ToolError("parallel sub-agents must use explore or review mode")
             normalized.append((task, mode, label))
         with self._lock:
-            remaining = self.config.max_subagents_per_turn - self._turn_count
+            remaining = self.max_per_turn - self._turn_count
             if len(normalized) > remaining:
                 raise ToolError(
                     "sub-agent limit reached for this turn: "
-                    f"{self.config.max_subagents_per_turn}"
+                    f"{self.max_per_turn}"
                 )
             assignments = []
             for task, mode, label in normalized:
@@ -124,7 +116,7 @@ class SubAgentManager:
                         "label": label or self._default_label(task),
                     }
                 )
-        worker_count = min(len(assignments), self.config.subagent_parallelism)
+        worker_count = min(len(assignments), self.parallelism)
         reports: dict[str, SubAgentReport] = {}
         with ThreadPoolExecutor(
             max_workers=worker_count, thread_name_prefix="rivet-subagent"
@@ -175,9 +167,14 @@ class SubAgentManager:
             or any(not isinstance(item, dict) for item in history)
         ):
             raise SessionError("saved sub-agent history must be a list of objects")
+        compatible_history = [
+            copy.deepcopy(item)
+            for item in history
+            if str(item.get("mode") or "").lower() in SUBAGENT_MODES
+        ]
         with self._lock:
             self._sequence = sequence
-            self._history = copy.deepcopy(history)
+            self._history = compatible_history
             self._active.clear()
             self._active_agents.clear()
 
@@ -201,10 +198,10 @@ class SubAgentManager:
         if mode not in SUBAGENT_MODES:
             raise ToolError(f"unsupported sub-agent mode: {mode}")
         with self._lock:
-            if self._turn_count >= self.config.max_subagents_per_turn:
+            if self._turn_count >= self.max_per_turn:
                 raise ToolError(
                     "sub-agent limit reached for this turn: "
-                    f"{self.config.max_subagents_per_turn}"
+                    f"{self.max_per_turn}"
                 )
             self._turn_count += 1
             self._sequence += 1
@@ -263,9 +260,8 @@ class SubAgentManager:
                 child_config,
                 self.client_factory(),
                 event_handler=child_event,
-                approver=self.approver,
                 workspace=self.workspace,
-                tool_scope="read_only" if mode in READ_ONLY_MODES else "full",
+                tool_scope="read_only",
                 enable_delegation=False,
                 cancel_event=self.cancel_event,
                 system_prompt_text=subagent_system_prompt(self.config.workspace, mode),
@@ -302,33 +298,10 @@ class SubAgentManager:
     def _report_from_result(assignment: JsonObject, result: Any) -> SubAgentReport:
         state = result.state if isinstance(result.state, dict) else {}
         inspected = state.get("inspected_files", [])
-        changed = state.get("changed_files", [])
-        commands = state.get("commands", [])
         inspected_files = [item for item in inspected if isinstance(item, str)]
-        changed_files = tuple(item for item in changed if isinstance(item, str))
-        command_evidence = []
-        if isinstance(commands, list):
-            for command in commands[-10:]:
-                if not isinstance(command, dict):
-                    continue
-                command_evidence.append(
-                    {
-                        "command": str(command.get("command") or ""),
-                        "exit_code": command.get("exit_code"),
-                        "verification": bool(command.get("verification")),
-                    }
-                )
-        verification = {
-            "required": bool(state.get("verification_required")),
-            "passed": bool(state.get("verification_passed")),
-        }
         risks: list[str] = []
         if not result.success:
             risks.append(f"sub-agent did not complete: {result.reason}")
-        if changed_files and not verification["passed"]:
-            risks.append("changed files were not successfully verified")
-        if state.get("workspace_tracking_complete") is False:
-            risks.append("workspace change tracking was incomplete")
         status = (
             "cancelled"
             if result.reason == "cancelled"
@@ -343,13 +316,7 @@ class SubAgentManager:
             summary=result.final,
             steps=result.steps,
             reason=result.reason,
-            evidence={
-                "inspected_files": inspected_files,
-                "commands": command_evidence,
-            },
-            changed_files=changed_files,
-            verification=verification,
-            tracking_complete=state.get("workspace_tracking_complete") is not False,
+            evidence={"inspected_files": inspected_files},
             risks=tuple(risks),
         )
 
@@ -367,10 +334,7 @@ class SubAgentManager:
             summary=summary,
             steps=0,
             reason=reason,
-            evidence={"inspected_files": [], "commands": []},
-            changed_files=(),
-            verification={"required": False, "passed": True},
-            tracking_complete=True,
+            evidence={"inspected_files": []},
             risks=(summary,),
         )
 

@@ -37,6 +37,21 @@ SNAPSHOT_TEXT_FILE_BYTES = 2_000_000
 SNAPSHOT_TEXT_BUDGET_BYTES = 20_000_000
 SNAPSHOT_CHANGE_REPORT_LIMIT = 200
 SNAPSHOT_IGNORED_FILES = {".coverage", ".DS_Store"}
+PREVIEW_DENIED_DIRECTORIES = {".aws", ".gnupg", ".ssh"}
+PREVIEW_DENIED_FILES = {
+    ".env",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "credentials",
+    "id_dsa",
+    "id_ed25519",
+    "id_ecdsa",
+    "id_rsa",
+}
+PREVIEW_DENIED_SUFFIXES = {".key", ".p12", ".pfx", ".pem"}
+OPERATION_HISTORY_LIMIT = 200
+OPERATION_FILES_LIMIT = 2_000
 
 
 @dataclass(frozen=True)
@@ -122,6 +137,10 @@ class Workspace:
         self.cancel_event = cancel_event
         self._original_text: dict[Path, str | None] = {}
         self._unavailable_diffs: dict[Path, str] = {}
+        self._tracked_current: dict[Path, dict[str, Any]] = {}
+        self._operations: list[dict[str, Any]] = []
+        self._next_operation_id = 1
+        self._pending_operation: dict[str, Any] | None = None
 
     def export_diff_state(self) -> dict[str, Any]:
         """Return the bounded baseline needed for /diff after session resume."""
@@ -131,7 +150,9 @@ class Workspace:
                 {
                     "path": self.display(target),
                     "content": self._original_text[target],
-                    "current": self._file_identity(target),
+                    "current": self._tracked_current.get(
+                        target, self._file_identity(target)
+                    ),
                 }
             )
         unavailable = []
@@ -140,10 +161,17 @@ class Workspace:
                 {
                     "path": self.display(target),
                     "reason": self._unavailable_diffs[target],
-                    "current": self._file_identity(target),
+                    "current": self._tracked_current.get(
+                        target, self._file_identity(target)
+                    ),
                 }
             )
-        return {"original_text": original, "unavailable_diffs": unavailable}
+        return {
+            "original_text": original,
+            "unavailable_diffs": unavailable,
+            "operations": self._export_operations(),
+            "next_operation_id": self._next_operation_id,
+        }
 
     def restore_diff_state(self, payload: Any) -> list[str]:
         """Restore diff baselines and report files changed since the session was saved."""
@@ -197,7 +225,151 @@ class Workspace:
         ]
         self._original_text = restored_original
         self._unavailable_diffs = restored_unavailable
+        self._tracked_current = saved_identities
+        self._operations, self._next_operation_id = self._restore_operations(
+            payload.get("operations", []), payload.get("next_operation_id")
+        )
         return sorted(drifted)
+
+    def begin_turn_operation(self, turn: int, task: str) -> None:
+        """Capture the workspace state before one user/agent turn."""
+        if self._pending_operation is not None:
+            raise ToolError("a turn checkpoint is already active")
+        self._pending_operation = {
+            "turn": turn,
+            "task": " ".join(task.split())[:240],
+            "before": self._capture_snapshot(capture_text=True),
+        }
+
+    def finish_turn_operation(self) -> dict[str, Any] | None:
+        """Commit one undoable record for all changes made during the turn."""
+        pending = self._pending_operation
+        self._pending_operation = None
+        if pending is None:
+            return None
+        before = pending["before"]
+        if not isinstance(before, WorkspaceSnapshot):
+            return None
+        after = self._capture_snapshot(capture_text=True)
+        changes = self._snapshot_changes(before, after)
+        if not changes:
+            return None
+
+        files: list[dict[str, Any]] = []
+        tracked_changes = changes if len(changes) <= OPERATION_FILES_LIMIT else []
+        for target, _change in tracked_changes:
+            old = before.files.get(target)
+            new = after.files.get(target)
+            before_exists = old is not None
+            before_text = old.text if old is not None and old.text_available else None
+            after_text_available = new is None or new.text_available
+            reversible = (not before_exists or before_text is not None) and after_text_available
+            reason = ""
+            if not reversible:
+                reason = "文件为二进制、过大或超出文本快照预算"
+            files.append(
+                {
+                    "path": target,
+                    "before_exists": before_exists,
+                    "before_text": before_text,
+                    "after": self._snapshot_identity(new),
+                    "reversible": reversible,
+                    "reason": reason,
+                }
+            )
+
+        operation = {
+            "id": self._next_operation_id,
+            "turn": pending["turn"],
+            "task": pending["task"],
+            "status": "active",
+            "tracking_complete": (
+                before.complete
+                and after.complete
+                and len(changes) <= OPERATION_FILES_LIMIT
+            ),
+            "total_file_count": len(changes),
+            "files": files,
+        }
+        self._next_operation_id += 1
+        self._operations.append(operation)
+        self._trim_operation_history()
+        return self._public_operation(operation)
+
+    def operation_history(self) -> list[dict[str, Any]]:
+        """Return turn-level change records with their current undo eligibility."""
+        return [self._public_operation(item) for item in self._operations]
+
+    def undo_operation(self, operation_id: int) -> dict[str, Any]:
+        """Undo one completed turn when every affected file still matches it."""
+        if not isinstance(operation_id, int) or isinstance(operation_id, bool):
+            raise ToolError("operation id must be an integer")
+        operation = next(
+            (item for item in self._operations if item.get("id") == operation_id),
+            None,
+        )
+        if operation is None:
+            raise ToolError(f"turn operation not found: {operation_id}")
+        if operation.get("status") != "active":
+            raise ToolError("this turn has already been undone")
+        files = operation.get("files", [])
+        if not operation.get("tracking_complete") or not all(
+            isinstance(item, dict) and item.get("reversible") is True for item in files
+        ):
+            raise ToolError("this turn cannot be safely undone from the saved snapshots")
+
+        drifted = [
+            self.display(item["path"])
+            for item in files
+            if self._file_identity(item["path"]) != item["after"]
+        ]
+        if drifted:
+            raise ToolError(
+                "files changed after this turn; undo the newer change first: "
+                + ", ".join(drifted[:5])
+            )
+
+        current_state: dict[Path, tuple[bool, str | None]] = {}
+        for item in files:
+            target = item["path"]
+            exists = target.exists()
+            current_state[target] = (
+                exists,
+                target.read_text(encoding="utf-8-sig") if exists else None,
+            )
+
+        applied: list[Path] = []
+        try:
+            for item in files:
+                target = item["path"]
+                self._restore_text_state(
+                    target,
+                    exists=bool(item["before_exists"]),
+                    content=item.get("before_text"),
+                )
+                applied.append(target)
+        except (OSError, ToolError) as exc:
+            rollback_error: Exception | None = None
+            for target in reversed(applied):
+                existed, content = current_state[target]
+                try:
+                    self._restore_text_state(target, exists=existed, content=content)
+                except (OSError, ToolError) as rollback_exc:
+                    rollback_error = rollback_exc
+                    break
+            if rollback_error is not None:
+                raise ToolError(
+                    f"turn undo failed and rollback was incomplete: {rollback_error}"
+                ) from exc
+            raise ToolError(f"turn undo failed; no changes were kept: {exc}") from exc
+
+        for item in files:
+            target = item["path"]
+            self._tracked_current[target] = self._file_identity(target)
+        operation["status"] = "undone"
+        result = self._public_operation(operation)
+        result["remaining"] = self.show_diff().get("files", [])
+        return result
 
     def resolve(self, relative_path: str, *, must_exist: bool = False) -> Path:
         if not isinstance(relative_path, str) or not relative_path.strip():
@@ -251,13 +423,14 @@ class Workspace:
         target = self.resolve(path, must_exist=True)
         if not target.is_dir():
             raise ToolError(f"not a directory: {path}")
-        if not 0 <= depth <= 8:
-            raise ToolError("depth must be between 0 and 8")
-        if not 1 <= max_entries <= 2000:
-            raise ToolError("max_entries must be between 1 and 2000")
+        if not 0 <= depth <= 32:
+            raise ToolError("depth must be between 0 and 32")
+        if not 1 <= max_entries <= 5000:
+            raise ToolError("max_entries must be between 1 and 5000")
 
         base_depth = len(target.parts)
         entries: list[str] = []
+        limit = max_entries + 1
         for current, dirnames, filenames in os.walk(target):
             current_path = Path(current)
             level = len(current_path.parts) - base_depth
@@ -266,9 +439,15 @@ class Workspace:
                 dirnames[:] = []
             for dirname in dirnames:
                 entries.append(self.display(current_path / dirname) + "/")
+                if len(entries) >= limit:
+                    break
+            if len(entries) >= limit:
+                break
             for filename in sorted(filenames):
                 entries.append(self.display(current_path / filename))
-            if len(entries) >= max_entries:
+                if len(entries) >= limit:
+                    break
+            if len(entries) >= limit:
                 break
         limited = entries[:max_entries]
         return {
@@ -276,6 +455,56 @@ class Workspace:
             "entries": limited,
             "truncated": len(entries) > max_entries,
         }
+
+    def preview_file(self, path: str, *, max_bytes: int = 500_000) -> dict[str, Any]:
+        """Return a bounded UTF-8 file preview for the local Web UI."""
+        if not 1 <= max_bytes <= 2_000_000:
+            raise ToolError("preview byte limit must be between 1 and 2000000")
+        target = self.resolve(path, must_exist=True)
+        if not self.preview_allowed(self.display(target)):
+            raise ToolError("sensitive files are hidden from Web preview")
+        if target.is_symlink() or not target.is_file():
+            raise ToolError(f"not a regular file: {path}")
+        try:
+            size = target.stat().st_size
+            with target.open("rb") as stream:
+                data = stream.read(max_bytes + 1)
+        except OSError as exc:
+            raise ToolError(f"could not read {path}: {exc}") from exc
+        if b"\x00" in data[:4096]:
+            raise ToolError(f"binary file cannot be previewed: {path}")
+        truncated = len(data) > max_bytes
+        if truncated:
+            data = data[:max_bytes]
+        try:
+            content = data.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ToolError(f"file is not UTF-8 text: {path}") from exc
+        changed_files = self.show_diff().get("files", [])
+        return {
+            "path": self.display(target),
+            "content": content,
+            "size": size,
+            "lines": content.count("\n") + (1 if content else 0),
+            "truncated": truncated,
+            "changed": self.display(target) in changed_files,
+        }
+
+    @staticmethod
+    def preview_allowed(path: str) -> bool:
+        """Return whether a workspace entry may be exposed in the Web file browser."""
+        normalized = path.rstrip("/")
+        parts = [part.casefold() for part in Path(normalized).parts]
+        if any(part in PREVIEW_DENIED_DIRECTORIES for part in parts):
+            return False
+        if not parts:
+            return True
+        name = parts[-1]
+        if name == ".env.example":
+            return True
+        if name in PREVIEW_DENIED_FILES or name.startswith(".env."):
+            return False
+        return Path(name).suffix.casefold() not in PREVIEW_DENIED_SUFFIXES
 
     def search_text(
         self,
@@ -328,6 +557,8 @@ class Workspace:
         existed = target.exists()
         self._remember_original(target)
         self._atomic_write(target, content)
+        after_identity = self._file_identity(target)
+        self._tracked_current[target] = after_identity
         return {
             "path": self.display(target),
             "action": "updated" if existed else "created",
@@ -352,6 +583,8 @@ class Workspace:
         updated = text.replace(old, new, count)
         self._remember_original(target, text=text)
         self._atomic_write(target, updated)
+        after_identity = self._file_identity(target)
+        self._tracked_current[target] = after_identity
         return {
             "path": self.display(target),
             "replacements": count,
@@ -408,6 +641,127 @@ class Workspace:
             "truncated": len(full_diff) > self.max_output_chars,
         }
 
+    def preview_diff(self, path: str | None = None) -> dict[str, Any]:
+        """Return a Web-safe diff that omits credential-bearing paths."""
+        if path is not None:
+            if not self.preview_allowed(path):
+                raise ToolError("sensitive files are hidden from Web diff")
+            return self.show_diff(path)
+
+        complete = self.show_diff()
+        files = complete.get("files", [])
+        visible = [
+            item
+            for item in files
+            if isinstance(item, str) and self.preview_allowed(item)
+        ]
+        hidden_count = len(files) - len(visible) if isinstance(files, list) else 0
+        parts: list[str] = []
+        truncated = False
+        for item in visible:
+            item_diff = self.show_diff(item)
+            parts.append(str(item_diff.get("diff") or ""))
+            truncated = truncated or bool(item_diff.get("truncated"))
+        combined = "".join(parts)
+        return {
+            "files": visible,
+            "diff": self._truncate(combined),
+            "truncated": truncated or len(combined) > self.max_output_chars,
+            "hidden_files": hidden_count,
+        }
+
+    def revert_changes(self, path: str | None = None) -> dict[str, Any]:
+        """Restore one or all tracked text files to their session baseline."""
+        changed = self.show_diff().get("files", [])
+        changed_set = {item for item in changed if isinstance(item, str)}
+        if path is not None:
+            target = self.resolve(path)
+            display_path = self.display(target)
+            if display_path not in changed_set:
+                raise ToolError(f"file has no tracked changes: {display_path}")
+            targets = [target]
+        else:
+            targets = [self.resolve(item) for item in sorted(changed_set)]
+        if not targets:
+            return {"reverted": [], "remaining": sorted(changed_set)}
+
+        unavailable = [
+            self.display(target) for target in targets if target in self._unavailable_diffs
+        ]
+        if unavailable:
+            joined = ", ".join(unavailable[:5])
+            raise ToolError(f"cannot safely restore files without a text baseline: {joined}")
+
+        drifted = [
+            self.display(target)
+            for target in targets
+            if target in self._tracked_current
+            and self._file_identity(target) != self._tracked_current[target]
+        ]
+        if drifted:
+            joined = ", ".join(drifted[:5])
+            raise ToolError(
+                f"refusing to overwrite files changed outside Rivet: {joined}"
+            )
+
+        current_state: dict[Path, tuple[bool, str | None]] = {}
+        for target in targets:
+            exists = target.exists()
+            current_state[target] = (
+                exists,
+                target.read_text(encoding="utf-8-sig") if exists else None,
+            )
+
+        reverted: list[str] = []
+        applied: list[Path] = []
+        try:
+            for target in targets:
+                if target not in self._original_text:
+                    raise ToolError(
+                        f"file has no restorable baseline: {self.display(target)}"
+                    )
+                original = self._original_text[target]
+                if original is None:
+                    if target.exists():
+                        if target.is_symlink() or not target.is_file():
+                            raise ToolError(
+                                f"refusing to remove non-file path: {self.display(target)}"
+                            )
+                        target.unlink()
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    self._atomic_write(target, original)
+                applied.append(target)
+                reverted.append(self.display(target))
+        except (OSError, ToolError) as exc:
+            rollback_error: Exception | None = None
+            for restored in reversed(applied):
+                existed, content = current_state[restored]
+                try:
+                    if existed:
+                        self._atomic_write(restored, content or "")
+                    elif restored.exists():
+                        restored.unlink()
+                except (OSError, ToolError) as rollback_exc:
+                    rollback_error = rollback_exc
+                    break
+            if rollback_error is not None:
+                raise ToolError(
+                    f"restore failed and rollback was incomplete: {rollback_error}"
+                ) from exc
+            raise ToolError(f"restore failed; no changes were kept: {exc}") from exc
+
+        for target in targets:
+            self._original_text.pop(target, None)
+            self._unavailable_diffs.pop(target, None)
+            self._tracked_current.pop(target, None)
+
+        remaining = self.show_diff().get("files", [])
+        return {
+            "reverted": reverted,
+            "remaining": remaining if isinstance(remaining, list) else [],
+        }
+
     @staticmethod
     def command_review_reason(command: str) -> str | None:
         for reason, pattern in REVIEW_COMMANDS:
@@ -453,6 +807,7 @@ class Workspace:
             if os.name == "nt"
             else 0
         )
+        started_at = time.monotonic()
         process = subprocess.Popen(
             command,
             cwd=self.root,
@@ -532,6 +887,9 @@ class Workspace:
         command_result["file_changes_truncated"] = changes_truncated
         command_result["tracking_complete"] = (
             before.complete and after.complete and not changes_truncated
+        )
+        command_result["duration_ms"] = max(
+            0, round((time.monotonic() - started_at) * 1000)
         )
         return command_result
 
@@ -733,6 +1091,24 @@ class Workspace:
     def _record_command_changes(
         self, before: WorkspaceSnapshot, after: WorkspaceSnapshot
     ) -> list[dict[str, Any]]:
+        changes = self._snapshot_changes(before, after)
+
+        payload: list[dict[str, Any]] = []
+        for target, change in changes:
+            self._remember_command_baseline(target, change, before.files.get(target))
+            self._tracked_current[target] = self._file_identity(target)
+            payload.append(
+                {
+                    "path": self.display(target),
+                    "change": change,
+                    "diff_available": target in self._original_text,
+                }
+            )
+        return payload
+
+    def _snapshot_changes(
+        self, before: WorkspaceSnapshot, after: WorkspaceSnapshot
+    ) -> list[tuple[Path, str]]:
         changes: list[tuple[Path, str]] = []
         all_paths = sorted(
             set(before.files) | set(after.files), key=lambda item: self.display(item)
@@ -746,18 +1122,7 @@ class Workspace:
                 changes.append((target, "deleted"))
             elif old.digest != new.digest:
                 changes.append((target, "modified"))
-
-        payload: list[dict[str, Any]] = []
-        for target, change in changes:
-            self._remember_command_baseline(target, change, before.files.get(target))
-            payload.append(
-                {
-                    "path": self.display(target),
-                    "change": change,
-                    "diff_available": target in self._original_text,
-                }
-            )
-        return payload
+        return changes
 
     def _remember_command_baseline(
         self, target: Path, change: str, old: FileSnapshot | None
@@ -799,6 +1164,203 @@ class Workspace:
         except UnicodeDecodeError as exc:
             raise ToolError(f"file is not UTF-8 text: {self.display(target)}") from exc
         self._original_text[target] = original
+
+    def _public_operation(self, operation: dict[str, Any]) -> dict[str, Any]:
+        files = operation.get("files", [])
+        paths = [self.display(item["path"]) for item in files]
+        status = str(operation.get("status") or "active")
+        can_undo = status == "active" and bool(operation.get("tracking_complete"))
+        blocked_reason = ""
+        if status != "active":
+            can_undo = False
+            blocked_reason = "本轮修改已经撤销"
+        elif not operation.get("tracking_complete"):
+            can_undo = False
+            blocked_reason = "工作区过大，无法确认完整修改范围"
+        elif not all(item.get("reversible") is True for item in files):
+            can_undo = False
+            blocked_reason = "包含无法安全恢复的二进制或超大文件"
+        elif any(self._file_identity(item["path"]) != item["after"] for item in files):
+            can_undo = False
+            blocked_reason = "相关文件后来又发生了变化"
+        return {
+            "id": operation.get("id"),
+            "turn": operation.get("turn"),
+            "task": str(operation.get("task") or ""),
+            "status": status,
+            "files": paths,
+            "file_count": int(operation.get("total_file_count", len(paths))),
+            "can_undo": can_undo,
+            "blocked_reason": blocked_reason,
+        }
+
+    def _export_operations(self) -> list[dict[str, Any]]:
+        exported: list[dict[str, Any]] = []
+        for operation in self._operations:
+            exported.append(
+                {
+                    "id": operation["id"],
+                    "turn": operation["turn"],
+                    "task": operation["task"],
+                    "status": operation["status"],
+                    "tracking_complete": operation["tracking_complete"],
+                    "total_file_count": operation.get(
+                        "total_file_count", len(operation["files"])
+                    ),
+                    "files": [
+                        {
+                            "path": self.display(item["path"]),
+                            "before_exists": item["before_exists"],
+                            "before_text": item["before_text"],
+                            "after": item["after"],
+                            "reversible": item["reversible"],
+                            "reason": item["reason"],
+                        }
+                        for item in operation["files"]
+                    ],
+                }
+            )
+        return exported
+
+    def _restore_operations(
+        self, payload: Any, next_operation_id: Any
+    ) -> tuple[list[dict[str, Any]], int]:
+        if not isinstance(payload, list) or len(payload) > OPERATION_HISTORY_LIMIT:
+            raise ToolError("saved turn operations must be a bounded list")
+        restored: list[dict[str, Any]] = []
+        seen_ids: set[int] = set()
+        file_count = 0
+        text_bytes = 0
+        for raw in payload:
+            if not isinstance(raw, dict):
+                raise ToolError("saved turn operation is invalid")
+            operation_id = raw.get("id")
+            turn = raw.get("turn")
+            task = raw.get("task")
+            status = raw.get("status")
+            tracking = raw.get("tracking_complete")
+            raw_files = raw.get("files")
+            total_file_count = raw.get("total_file_count")
+            if (
+                not isinstance(operation_id, int)
+                or isinstance(operation_id, bool)
+                or operation_id < 1
+                or operation_id in seen_ids
+                or not isinstance(turn, int)
+                or isinstance(turn, bool)
+                or turn < 1
+                or not isinstance(task, str)
+                or len(task) > 240
+                or status not in {"active", "undone", "reverted"}
+                or not isinstance(tracking, bool)
+                or not isinstance(raw_files, list)
+            ):
+                raise ToolError("saved turn operation metadata is invalid")
+            if total_file_count is None:
+                total_file_count = len(raw_files)
+            if (
+                not isinstance(total_file_count, int)
+                or isinstance(total_file_count, bool)
+                or total_file_count < len(raw_files)
+            ):
+                raise ToolError("saved turn operation file count is invalid")
+            seen_ids.add(operation_id)
+            files: list[dict[str, Any]] = []
+            for raw_file in raw_files:
+                file_count += 1
+                if file_count > OPERATION_FILES_LIMIT or not isinstance(raw_file, dict):
+                    raise ToolError("saved turn operations contain too many files")
+                path = raw_file.get("path")
+                before_exists = raw_file.get("before_exists")
+                before_text = raw_file.get("before_text")
+                reversible = raw_file.get("reversible")
+                reason = raw_file.get("reason", "")
+                if (
+                    not isinstance(path, str)
+                    or not isinstance(before_exists, bool)
+                    or (before_text is not None and not isinstance(before_text, str))
+                    or not isinstance(reversible, bool)
+                    or not isinstance(reason, str)
+                ):
+                    raise ToolError("saved turn operation file is invalid")
+                if not before_exists and before_text is not None:
+                    raise ToolError("saved new-file checkpoint has invalid content")
+                if isinstance(before_text, str):
+                    text_bytes += len(before_text.encode("utf-8"))
+                    if text_bytes > SNAPSHOT_TEXT_BUDGET_BYTES:
+                        raise ToolError("saved turn operation text exceeds the restore budget")
+                files.append(
+                    {
+                        "path": self.resolve(path),
+                        "before_exists": before_exists,
+                        "before_text": before_text,
+                        "after": self._validate_file_identity(raw_file.get("after")),
+                        "reversible": reversible,
+                        "reason": reason,
+                    }
+                )
+            restored.append(
+                {
+                    "id": operation_id,
+                    "turn": turn,
+                    "task": task,
+                    "status": status,
+                    "tracking_complete": tracking,
+                    "total_file_count": total_file_count,
+                    "files": files,
+                }
+            )
+        maximum = max(seen_ids, default=0)
+        if next_operation_id is None:
+            next_id = maximum + 1
+        elif (
+            not isinstance(next_operation_id, int)
+            or isinstance(next_operation_id, bool)
+            or next_operation_id <= maximum
+        ):
+            raise ToolError("saved next turn operation id is invalid")
+        else:
+            next_id = next_operation_id
+        return restored, next_id
+
+    def _trim_operation_history(self) -> None:
+        """Keep persisted turn checkpoints inside the same restore budgets."""
+        while self._operations:
+            file_count = sum(len(item.get("files", [])) for item in self._operations)
+            text_bytes = sum(
+                len(file.get("before_text", "").encode("utf-8"))
+                for item in self._operations
+                for file in item.get("files", [])
+                if isinstance(file.get("before_text"), str)
+            )
+            if (
+                len(self._operations) <= OPERATION_HISTORY_LIMIT
+                and file_count <= OPERATION_FILES_LIMIT
+                and text_bytes <= SNAPSHOT_TEXT_BUDGET_BYTES
+            ):
+                return
+            self._operations.pop(0)
+
+    @staticmethod
+    def _snapshot_identity(snapshot: FileSnapshot | None) -> dict[str, Any]:
+        if snapshot is None:
+            return {"kind": "missing", "sha256": None}
+        return {"kind": "file", "sha256": snapshot.digest}
+
+    def _restore_text_state(
+        self, target: Path, *, exists: bool, content: str | None
+    ) -> None:
+        if exists:
+            if content is None:
+                raise ToolError(f"missing text snapshot for {self.display(target)}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            self._atomic_write(target, content)
+        elif target.exists():
+            if target.is_symlink() or not target.is_file():
+                raise ToolError(
+                    f"refusing to remove non-file path: {self.display(target)}"
+                )
+            target.unlink()
 
     @staticmethod
     def _validate_file_identity(value: Any) -> dict[str, Any]:

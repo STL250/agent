@@ -14,6 +14,7 @@ from .workspace import Workspace
 
 Approver = Callable[[str, str], bool]
 DelegateHandler = Callable[..., JsonObject]
+SkillHandler = Callable[..., JsonObject]
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,9 @@ class ToolRegistry:
         tool_scope: str = "full",
         delegate_handler: DelegateHandler | None = None,
         delegate_many_handler: DelegateHandler | None = None,
+        skill_list_handler: SkillHandler | None = None,
+        skill_activate_handler: SkillHandler | None = None,
+        skill_resource_handler: SkillHandler | None = None,
     ) -> None:
         self.config = config
         self.workspace = workspace or Workspace(
@@ -63,6 +67,9 @@ class ToolRegistry:
         self.tool_scope = tool_scope
         self.delegate_handler = delegate_handler
         self.delegate_many_handler = delegate_many_handler
+        self.skill_list_handler = skill_list_handler
+        self.skill_activate_handler = skill_activate_handler
+        self.skill_resource_handler = skill_resource_handler
         tools = self._build_tools()
         if tool_scope == "read_only":
             allowed = {"update_plan", "list_files", "read_file", "search_text", "show_diff"}
@@ -398,8 +405,9 @@ class ToolRegistry:
                 ToolSpec(
                     "delegate_task",
                     "Delegate one bounded specialist task to an isolated sub-agent and return "
-                    "a structured evidence report. Use explore or review for read-only work; "
-                    "use implement only when the sub-agent must edit files.",
+                    "a structured evidence report. Explorer locates relevant code and evidence; "
+                    "reviewer independently checks correctness and risks. Both are read-only; "
+                    "the main agent must perform every file change and command.",
                     {
                         **object_schema,
                         "properties": {
@@ -410,7 +418,7 @@ class ToolRegistry:
                             },
                             "mode": {
                                 "type": "string",
-                                "enum": ["explore", "implement", "review"],
+                                "enum": ["explore", "review"],
                             },
                             "label": {
                                 "type": "string",
@@ -427,7 +435,7 @@ class ToolRegistry:
             tools.append(
                 ToolSpec(
                     "delegate_readonly_tasks",
-                    "Run two or three independent read-only exploration or review assignments "
+                    "Run exactly two independent read-only exploration or review assignments "
                     "in parallel and return one structured report per sub-agent.",
                     {
                         **object_schema,
@@ -435,7 +443,7 @@ class ToolRegistry:
                             "tasks": {
                                 "type": "array",
                                 "minItems": 2,
-                                "maxItems": 3,
+                                "maxItems": 2,
                                 "items": {
                                     "type": "object",
                                     "additionalProperties": False,
@@ -462,6 +470,61 @@ class ToolRegistry:
                         "required": ["tasks"],
                     },
                     self.delegate_many_handler,
+                )
+            )
+        if self.skill_list_handler is not None:
+            tools.append(
+                ToolSpec(
+                    "list_skills",
+                    "List the available reusable skills and their activation state. Skill "
+                    "instructions are intentionally omitted until activate_skill is called.",
+                    object_schema,
+                    self.skill_list_handler,
+                )
+            )
+        if self.skill_activate_handler is not None:
+            tools.append(
+                ToolSpec(
+                    "activate_skill",
+                    "Load one relevant SKILL.md workflow into the current turn. Use this when "
+                    "the user names a skill or the catalog shows a clear task match.",
+                    {
+                        **object_schema,
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 64,
+                            }
+                        },
+                        "required": ["name"],
+                    },
+                    self.skill_activate_handler,
+                )
+            )
+        if self.skill_resource_handler is not None:
+            tools.append(
+                ToolSpec(
+                    "read_skill_resource",
+                    "Read one UTF-8 resource explicitly listed by an already active skill. "
+                    "This never executes the resource.",
+                    {
+                        **object_schema,
+                        "properties": {
+                            "skill": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 64,
+                            },
+                            "path": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 1000,
+                            },
+                        },
+                        "required": ["skill", "path"],
+                    },
+                    self.skill_resource_handler,
                 )
             )
         return tuple(tools)
