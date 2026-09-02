@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "rivet-code-agent"
 version = "1.9.0"
 description = "A small coding agent built from first principles"
-readme = "README.txt"
+readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 dependencies = []
